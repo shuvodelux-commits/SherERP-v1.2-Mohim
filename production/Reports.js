@@ -605,10 +605,16 @@ function getCashBankReport(token, filters) {
  */
 function computePurchaseDiscountIncome_(range) {
   const purchasesInRange = activeRows_('PURCHASES').filter(function (p) {
-    return inRange_(safeDateOnly_(p['Date']), range) && (Number(p['Discount']) || 0) > 0;
+    return inRange_(safeDateOnly_(p['Date']), range) &&
+      ((Number(p['Discount']) || 0) > 0 || (Number(p['Landed Cost']) || 0) > 0);
   });
   if (!purchasesInRange.length) {
-    return { grossPurchaseDiscount: 0, returnedPurchaseDiscount: 0, netPurchaseDiscount: 0 };
+    return {
+      grossPurchaseDiscount: 0,
+      returnedPurchaseDiscount: 0,
+      netPurchaseDiscount: 0,
+      returnedPurchaseLandedCost: 0
+    };
   }
 
   const purchaseById = {};
@@ -619,52 +625,66 @@ function computePurchaseDiscountIncome_(range) {
     grossPurchaseDiscount = roundMoney_(grossPurchaseDiscount + (Number(p['Discount']) || 0));
   });
 
-  // Map gross unit price per (Purchase ID, Product ID) from PURCHASE_ITEMS so
-  // returned discount = returnedGross - returnedEconomic even at 100% discount.
+  // Map gross unit price & landed share per (Purchase ID, Product ID) from PURCHASE_ITEMS so
+  // returned discount = returnedGross - returnedEconomic and returned landed cost is exact.
   const boughtByPurchaseProduct = {};
   getAllRows_('PURCHASE_ITEMS').forEach(function (pi) {
     const pid = pi['Purchase ID'];
     if (!purchaseById[pid]) return;
     const key = pid + '|' + pi['Product ID'];
-    if (!boughtByPurchaseProduct[key]) boughtByPurchaseProduct[key] = { qty: 0, grossValue: 0 };
+    if (!boughtByPurchaseProduct[key]) boughtByPurchaseProduct[key] = { qty: 0, grossValue: 0, landedShare: 0 };
     const qty = Number(pi['Quantity']) || 0;
     boughtByPurchaseProduct[key].qty += qty;
     boughtByPurchaseProduct[key].grossValue += qty * (Number(pi['Unit Price']) || 0);
+    boughtByPurchaseProduct[key].landedShare = roundMoney_(
+      boughtByPurchaseProduct[key].landedShare + (Number(pi['Landed Cost']) || 0)
+    );
   });
 
   const returnedDiscByPurchase = {};
+  const returnedLandedByPurchase = {};
   activePurchaseReturnItems_().forEach(function (ri) {
     const pid = ri['Purchase ID'];
     const parent = purchaseById[pid];
     if (!parent) return;
     const retQty = Number(ri['Return Quantity']) || 0;
     if (retQty <= 0) return;
-    const economic = economicReturnLineAmount_(ri, parent['Subtotal'], parent['Grand Total']);
+    const sub = Number(parent['Subtotal']) || 0;
+    const disc = Number(parent['Discount']) || 0;
+    const goodsNet = roundMoney_(Math.max(0, sub - disc));
+    const economic = economicReturnLineAmount_(ri, sub, goodsNet);
     const bought = boughtByPurchaseProduct[pid + '|' + ri['Product ID']];
     let returnedGross = 0;
     if (bought && bought.qty > 0) {
       returnedGross = roundMoney_(retQty * (bought.grossValue / bought.qty));
+      if (bought.landedShare > 0) {
+        const lineLanded = roundMoney_(retQty * (bought.landedShare / bought.qty));
+        returnedLandedByPurchase[pid] = roundMoney_((returnedLandedByPurchase[pid] || 0) + lineLanded);
+      }
     } else {
-      const sub = Number(parent['Subtotal']) || 0;
-      const grand = Number(parent['Grand Total']) || 0;
-      returnedGross = grand > 0 && sub > 0 ? roundMoney_(economic * (sub / grand)) : economic;
+      returnedGross = goodsNet > 0 && sub > 0 ? roundMoney_(economic * (sub / goodsNet)) : economic;
     }
     const lineReturnedDisc = Math.max(0, roundMoney_(returnedGross - economic));
     returnedDiscByPurchase[pid] = roundMoney_((returnedDiscByPurchase[pid] || 0) + lineReturnedDisc);
   });
 
   let returnedPurchaseDiscount = 0;
+  let returnedPurchaseLandedCost = 0;
   Object.keys(purchaseById).forEach(function (pid) {
     const maxDisc = roundMoney_(Number(purchaseById[pid]['Discount']) || 0);
     const clawedBack = Math.min(maxDisc, roundMoney_(returnedDiscByPurchase[pid] || 0));
     returnedPurchaseDiscount = roundMoney_(returnedPurchaseDiscount + clawedBack);
+    const maxLanded = roundMoney_(Number(purchaseById[pid]['Landed Cost']) || 0);
+    const landedLoss = Math.min(maxLanded, roundMoney_(returnedLandedByPurchase[pid] || 0));
+    returnedPurchaseLandedCost = roundMoney_(returnedPurchaseLandedCost + landedLoss);
   });
 
   const netPurchaseDiscount = roundMoney_(Math.max(0, grossPurchaseDiscount - returnedPurchaseDiscount));
   return {
     grossPurchaseDiscount: grossPurchaseDiscount,
     returnedPurchaseDiscount: returnedPurchaseDiscount,
-    netPurchaseDiscount: netPurchaseDiscount
+    netPurchaseDiscount: netPurchaseDiscount,
+    returnedPurchaseLandedCost: returnedPurchaseLandedCost
   };
 }
 
@@ -816,7 +836,8 @@ function computeProfit_(range) {
   const settlementDiscount = computeSettlementDiscountProfit_(range);
   const purchaseDiscount = computePurchaseDiscountIncome_(range);
   const netProfit = roundMoney_(
-    grossProfit - expenses + settlementDiscount.netProfitImpact + purchaseDiscount.netPurchaseDiscount
+    grossProfit - expenses + settlementDiscount.netProfitImpact +
+    purchaseDiscount.netPurchaseDiscount - (purchaseDiscount.returnedPurchaseLandedCost || 0)
   );
   // Replace virtual kit quantity with the physical inventory quantities
   // required by the saved sale-time recipe. Returns already reduced parent
@@ -864,6 +885,7 @@ function computeProfit_(range) {
       grossPurchaseDiscount: purchaseDiscount.grossPurchaseDiscount,
       returnedPurchaseDiscount: purchaseDiscount.returnedPurchaseDiscount,
       purchaseDiscountIncome: purchaseDiscount.netPurchaseDiscount,
+      returnedPurchaseLandedCost: purchaseDiscount.returnedPurchaseLandedCost || 0,
       customerSettlementDiscount: settlementDiscount.customerDiscountGiven,
       supplierSettlementDiscountReceived: settlementDiscount.supplierDiscountReceived,
       settlementDiscountNetImpact: settlementDiscount.netProfitImpact,

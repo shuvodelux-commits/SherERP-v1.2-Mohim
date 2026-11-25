@@ -181,7 +181,9 @@ function getPurchaseForUpdate(token, purchaseId) {
     return ok_({
       purchaseId: p['Purchase ID'], date: safeDateOnly_(p['Date']),
       supplierId: p['Supplier ID'], supplierName: p['Supplier Name'],
-      discount: Number(p['Discount']) || 0, paidAmount: Number(p['Paid Amount']) || 0,
+      discount: Number(p['Discount']) || 0,
+      landedCost: Number(p['Landed Cost']) || 0,
+      paidAmount: Number(p['Paid Amount']) || 0,
       paymentMethod: p['Payment Method'] || (Number(p['Paid Amount']) > 0 ? 'Cash' : ''),
       bankAccountId: p['Bank Account ID'] || '',
       notes: p['Notes'] || '',
@@ -257,6 +259,7 @@ function updatePurchaseInternal_(token, purchaseId, payload, options) {
     const newPriceByProduct = {};
     const newSellPriceByProduct = {};
     const seenProduct = {};
+    const newLinesForLanded = [];
     payload.items.forEach(function (item, i) {
       const qty = Number(item.qty), price = Number(item.unitPrice), sellPrice = Number(item.sellingPrice);
       if (!isValidNonNegativeNumber_(qty) || qty <= 0) throw new Error('Line ' + (i + 1) + ': quantity must be greater than zero.');
@@ -267,7 +270,24 @@ function updatePurchaseInternal_(token, purchaseId, payload, options) {
       newQtyByProduct[item.productId] = qty;
       newPriceByProduct[item.productId] = price;
       newSellPriceByProduct[item.productId] = sellPrice;
-      subtotal = roundMoney_(subtotal + roundMoney_(qty * price));
+      const lineTotal = roundMoney_(qty * price);
+      newLinesForLanded.push({ productId: item.productId, qty: qty, price: price, lineTotal: lineTotal });
+      subtotal = roundMoney_(subtotal + lineTotal);
+    });
+
+    const rawLanded = payload.landedCost;
+    if (rawLanded !== undefined && rawLanded !== null && rawLanded !== '' && !isValidNonNegativeNumber_(rawLanded)) {
+      return fail_('Landed cost must be a valid non-negative number.');
+    }
+    const landedCost = rawLanded !== undefined && rawLanded !== null && rawLanded !== ''
+      ? roundMoney_(Number(rawLanded))
+      : roundMoney_(Number(purchase['Landed Cost']) || 0);
+    const landedAllocs = allocatePurchaseLandedCosts_(newLinesForLanded, subtotal, landedCost);
+    const newLandedShareByProduct = {};
+    const newLandedUnitCostByProduct = {};
+    newLinesForLanded.forEach(function (l, idx) {
+      newLandedShareByProduct[l.productId] = landedAllocs[idx].landedShare;
+      newLandedUnitCostByProduct[l.productId] = landedAllocs[idx].landedUnitCost;
     });
 
     const productsById = {};
@@ -283,16 +303,16 @@ function updatePurchaseInternal_(token, purchaseId, payload, options) {
       if (l['Purchase ID'] === purchaseId) lotByProduct[l['Product ID']] = l;
     });
 
-    // Cost changes affect future FIFO COGS. Once any unit from a purchase lot
-    // has been sold, silently changing its unit cost would make the Purchase
-    // report disagree with already-recorded SALE_ITEM_LOTS COGS, so block it.
+    // Cost changes (unit price OR landed cost proration) affect future FIFO COGS.
+    // Once any unit from a purchase lot has been sold, silently changing its
+    // effective unit cost would make Purchase reports disagree with SALE_ITEM_LOTS COGS.
     const costChanges = [];
     Object.keys(newPriceByProduct).forEach(function (productId) {
       if (oldPriceByProduct[productId] === undefined) return; // new line gets a new lot below
-      const oldPrice = oldPriceByProduct[productId];
-      const newPrice = newPriceByProduct[productId];
-      if (Math.abs(oldPrice - newPrice) < 0.0000001) return;
       const lot = lotByProduct[productId];
+      const oldEffectivePrice = lot ? (Number(lot['Purchase Price']) || 0) : oldPriceByProduct[productId];
+      const newEffectivePrice = newLandedUnitCostByProduct[productId];
+      if (Math.abs(oldEffectivePrice - newEffectivePrice) < 0.0000001) return;
       if (!lot) throw new Error('This purchase has no stock lot on file, so its unit price cannot be changed safely.');
       const original = Number(lot['Original Quantity']) || 0;
       const remaining = Number(lot['Remaining Quantity']) || 0;
@@ -300,9 +320,9 @@ function updatePurchaseInternal_(token, purchaseId, payload, options) {
       // with the price, so it does not count as "already sold" here.
       const consumed = Math.max(0, original - remaining - settledQuantityOfLot_(lot));
       if (consumed > 0) {
-        throw new Error('Purchase price cannot be changed after stock from this lot has already been sold. Use a cost adjustment/correction instead.');
+        throw new Error('Purchase price or landed cost cannot be changed after stock from this lot has already been sold. Use a cost adjustment/correction instead.');
       }
-      costChanges.push({ lot: lot, newPrice: newPrice });
+      costChanges.push({ lot: lot, newPrice: newEffectivePrice });
     });
 
     const allProductIds = {};
@@ -363,13 +383,13 @@ function updatePurchaseInternal_(token, purchaseId, payload, options) {
         productId: productId, name: product['Product Name'], rowIndex: product._rowIndex,
         delta: delta, newStock: newStock, lot: lot || null,
         hasNewLine: newPriceByProduct[productId] !== undefined,
-        linePrice: newPriceByProduct[productId] === undefined ? 0 : newPriceByProduct[productId],
+        linePrice: newLandedUnitCostByProduct[productId] === undefined ? 0 : newLandedUnitCostByProduct[productId],
         lineSellPrice: newSellPriceByProduct[productId] === undefined ? 0 : newSellPriceByProduct[productId]
       });
     });
 
     const discount = isValidNonNegativeNumber_(payload.discount) ? roundMoney_(Number(payload.discount)) : 0;
-    const grandTotal = roundMoney_(Math.max(0, subtotal - discount));
+    const grandTotal = roundMoney_(Math.max(0, subtotal - discount) + landedCost);
     let paidAmount = isValidNonNegativeNumber_(payload.paidAmount) ? roundMoney_(Number(payload.paidAmount)) : 0;
     if (paidAmount > grandTotal) paidAmount = grandTotal;
     const dueAmount = roundMoney_(grandTotal - paidAmount);
@@ -429,7 +449,9 @@ function updatePurchaseInternal_(token, purchaseId, payload, options) {
       const qty = Number(item.qty), price = Number(item.unitPrice), sellPrice = Number(item.sellingPrice);
       return {
         'Purchase ID': purchaseId, 'Product ID': item.productId, 'Product Name': item.name,
-        'Quantity': qty, 'Unit Price': price, 'Sell Price': sellPrice, 'Line Total': roundMoney_(qty * price)
+        'Quantity': qty, 'Unit Price': price, 'Sell Price': sellPrice, 'Line Total': roundMoney_(qty * price),
+        'Landed Cost': newLandedShareByProduct[item.productId] || 0,
+        'Landed Unit Cost': newLandedUnitCostByProduct[item.productId] !== undefined ? newLandedUnitCostByProduct[item.productId] : price
       };
     }));
 
@@ -533,7 +555,7 @@ function updatePurchaseInternal_(token, purchaseId, payload, options) {
       'Is Backdated': editBackdate.isBackdated, 'Backdated Days': editBackdate.backdatedDays,
       'Backdated Reason': purchase['Backdated Reason'] || '',
       'Supplier ID': supplierId, 'Supplier Name': supplierName,
-      'Subtotal': subtotal, 'Discount': discount, 'Grand Total': grandTotal,
+      'Subtotal': subtotal, 'Discount': discount, 'Landed Cost': landedCost, 'Grand Total': grandTotal,
       'Paid Amount': paidAmount, 'Due Amount': dueAmount, 'Payment Status': paymentStatus,
       'Notes': sanitizeInput_(payload.notes),
       'Payment Method': paymentMethod, 'Bank Account ID': bankAccountId, 'Bank Account Name': bankAccountName

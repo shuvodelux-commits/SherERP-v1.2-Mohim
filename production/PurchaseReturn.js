@@ -102,12 +102,13 @@ function getPurchaseForReturn(token, purchaseId) {
     const returnItems = activePurchaseReturnItems_().filter(function (i) { return i['Purchase ID'] === purchaseId; });
     const subtotal = Number(purchase['Subtotal']) || 0;
     const grandTotal = Number(purchase['Grand Total']) || 0;
+    const goodsNetTotal = roundMoney_(Math.max(0, subtotal - (Number(purchase['Discount']) || 0)));
 
     const returnedByProduct = {};
     let previouslyReturnedAmount = 0;
     returnItems.forEach(function (ri) {
       returnedByProduct[ri['Product ID']] = (returnedByProduct[ri['Product ID']] || 0) + (Number(ri['Return Quantity']) || 0);
-      previouslyReturnedAmount += economicReturnLineAmount_(ri, subtotal, grandTotal);
+      previouslyReturnedAmount += economicReturnLineAmount_(ri, subtotal, goodsNetTotal);
     });
 
     // Aggregate historical duplicate product lines into one return-cart row.
@@ -143,7 +144,7 @@ function getPurchaseForReturn(token, purchaseId) {
       return {
         productId: id,
         name: item.name,
-        unitPrice: roundMoney_(effectiveTransactionUnitPrice_(grossUnitPrice, subtotal, grandTotal)),
+        unitPrice: roundMoney_(effectiveTransactionUnitPrice_(grossUnitPrice, subtotal, goodsNetTotal)),
         boughtQty: item.boughtQty,
         previouslyReturnedQty: already,
         availableQty: availableQty
@@ -201,6 +202,7 @@ function completePurchaseReturn(token, payload) {
     const returnItemsSoFar = activePurchaseReturnItems_().filter(function (i) { return i['Purchase ID'] === payload.purchaseId; });
     const purchaseSubtotal = Number(purchase['Subtotal']) || 0;
     const purchaseGrandTotal = Number(purchase['Grand Total']) || 0;
+    const purchaseGoodsNetTotal = roundMoney_(Math.max(0, purchaseSubtotal - (Number(purchase['Discount']) || 0)));
 
     const boughtByProduct = {};
     purchaseItems.forEach(function (pi) {
@@ -219,7 +221,7 @@ function completePurchaseReturn(token, payload) {
       const pid = ri['Product ID'];
       returnedByProduct[pid] = (returnedByProduct[pid] || 0) + (Number(ri['Return Quantity']) || 0);
       returnedValueByProduct[pid] = roundMoney_(
-        (returnedValueByProduct[pid] || 0) + economicReturnLineAmount_(ri, purchaseSubtotal, purchaseGrandTotal)
+        (returnedValueByProduct[pid] || 0) + economicReturnLineAmount_(ri, purchaseSubtotal, purchaseGoodsNetTotal)
       );
     });
 
@@ -238,7 +240,7 @@ function completePurchaseReturn(token, payload) {
       if (qty > available) throw new Error(bought.name + ': only ' + available + ' available to return.');
 
       const grossUnitPrice = bought.boughtQty > 0 ? bought.grossValue / bought.boughtQty : 0;
-      const effectiveUnitPrice = effectiveTransactionUnitPrice_(grossUnitPrice, purchaseSubtotal, purchaseGrandTotal);
+      const effectiveUnitPrice = effectiveTransactionUnitPrice_(grossUnitPrice, purchaseSubtotal, purchaseGoodsNetTotal);
       const maxReturnValue = roundMoney_(bought.boughtQty * effectiveUnitPrice);
       const alreadyReturnedValue = returnedValueByProduct[item.productId] || 0;
       const remainingReturnValue = Math.max(0, roundMoney_(maxReturnValue - alreadyReturnedValue));

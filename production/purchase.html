@@ -121,6 +121,17 @@
           style="width: 110px; text-align: right"
         />
       </div>
+      <div class="totals-row">
+        <span>Transport / Landed Cost <span class="bn-hint" style="display:inline;">— পরিবহন খরচ</span></span>
+        <input
+          id="purLandedCost"
+          type="number"
+          min="0"
+          step="0.01"
+          value="0"
+          style="width: 110px; text-align: right"
+        />
+      </div>
       <div class="totals-row grand">
         <span>Grand Total <span class="bn-hint" style="display:inline;">— সর্বমোট টাকা</span></span><span class="v" id="purGrandTotal">0</span>
       </div>
@@ -636,6 +647,7 @@
     document.getElementById('purBackdatedReasonRow').style.display = 'none';
     document.getElementById('purNotes').value = p.notes || '';
     document.getElementById('purDiscount').value = p.discount || 0;
+    document.getElementById('purLandedCost').value = p.landedCost || 0;
     document.getElementById('purPaidAmount').value = p.paidAmount || 0;
     document.getElementById('purPaymentMethod').value = p.paymentMethod || 'Cash';
     document.getElementById('purBankAccountRow').style.display = paymentMethodNeedsAccount_(p.paymentMethod) ? '' : 'none';
@@ -685,6 +697,7 @@
     purFillProductPicker_();
     document.getElementById("purNotes").value = "";
     document.getElementById("purDiscount").value = 0;
+    document.getElementById("purLandedCost").value = 0;
     document.getElementById("purPaidAmount").value = 0;
     document.getElementById("purPaymentMethod").value = "Cash";
     document.getElementById("purBankAccountRow").style.display = "none";
@@ -1286,6 +1299,9 @@
     .getElementById("purDiscount")
     .addEventListener("input", purRecalcTotals_);
   document
+    .getElementById("purLandedCost")
+    .addEventListener("input", purRecalcTotals_);
+  document
     .getElementById("purPaidAmount")
     .addEventListener("input", purRecalcTotals_);
   document
@@ -1317,7 +1333,8 @@
       return s + (Number(l.qty) || 0) * (Number(l.unitPrice) || 0);
     }, 0);
     var discount = Number(document.getElementById("purDiscount").value) || 0;
-    var grandTotal = Math.max(0, subtotal - discount);
+    var landedCost = Math.max(0, Number(document.getElementById("purLandedCost").value) || 0);
+    var grandTotal = Math.max(0, subtotal - discount) + landedCost;
     var paid = Number(document.getElementById("purPaidAmount").value) || 0;
     if (paid > grandTotal) paid = grandTotal;
     var due = grandTotal - paid;
@@ -1360,6 +1377,7 @@
           return item;
         }),
         discount: document.getElementById("purDiscount").value,
+        landedCost: document.getElementById("purLandedCost").value,
         paidAmount: document.getElementById("purPaidAmount").value,
         paymentMethod: document.getElementById("purPaymentMethod").value,
         bankAccountId: document.getElementById("purBankAccount").value,
@@ -1372,6 +1390,7 @@
         purState.cartEntryIndex = null;
         purState.cartEditIndex = null;
         document.getElementById('purDiscount').value = 0;
+        document.getElementById('purLandedCost').value = 0;
         document.getElementById('purPaidAmount').value = 0;
         document.getElementById('purPaymentMethod').value = 'Cash';
         document.getElementById('purBankAccountRow').style.display = 'none';
@@ -1393,7 +1412,8 @@
       if (isUpdate) payload.reason = purState.updateReason;
       var purchaseSubtotal = purState.cart.reduce(function (sum, line) { return sum + (Number(line.qty) || 0) * (Number(line.unitPrice) || 0); }, 0);
       var purchaseDiscount = Number(payload.discount) || 0;
-      var purchaseTotal = Math.max(0, purchaseSubtotal - purchaseDiscount);
+      var purchaseLanded = Math.max(0, Number(payload.landedCost) || 0);
+      var purchaseTotal = Math.max(0, purchaseSubtotal - purchaseDiscount) + purchaseLanded;
       var purchasePaid = Math.min(purchaseTotal, Math.max(0, Number(payload.paidAmount) || 0));
       var purchaseDue = purchaseTotal - purchasePaid;
       runConfirmedAction({

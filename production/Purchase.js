@@ -102,6 +102,37 @@ function getPurchaseBootstrap(token) {
  * }
  * item.sellingPrice is required; it becomes this purchase lot's sell price and the product's latest/default selling price.
  */
+/**
+ * Prorates purchase-level landed cost (freight / transport / duty) across
+ * item lines by line value (falling back to quantity if subtotal <= 0).
+ * Assigns any rounding residual to the final line so sum(landedShare) === landedCost.
+ */
+function allocatePurchaseLandedCosts_(lines, subtotal, landedCost) {
+  const totalLanded = isValidNonNegativeNumber_(landedCost) ? roundMoney_(Number(landedCost)) : 0;
+  const count = (lines || []).length;
+  if (!count) return [];
+  const totalQty = lines.reduce(function (s, l) { return s + (Number(l.qty) || 0); }, 0);
+  let allocated = 0;
+  return lines.map(function (l, idx) {
+    const qty = Number(l.qty) || 0;
+    const price = Number(l.price) || 0;
+    const lineTotal = l.lineTotal !== undefined ? Number(l.lineTotal) : roundMoney_(qty * price);
+    let share = 0;
+    if (totalLanded > 0) {
+      if (idx === count - 1) {
+        share = roundMoney_(Math.max(0, totalLanded - allocated));
+      } else if (subtotal > 0) {
+        share = roundMoney_(totalLanded * (lineTotal / subtotal));
+      } else if (totalQty > 0) {
+        share = roundMoney_(totalLanded * (qty / totalQty));
+      }
+      allocated = roundMoney_(allocated + share);
+    }
+    const landedUnitCost = qty > 0 ? (lineTotal + share) / qty : price;
+    return { landedShare: share, landedUnitCost: landedUnitCost };
+  });
+}
+
 function createPurchase(token, payload) {
   const lock = LockService.getScriptLock();
   lock.waitLock(CONFIG.LOCK_TIMEOUT_MS);
@@ -184,7 +215,17 @@ function createPurchase(token, payload) {
     });
 
     const discount = isValidNonNegativeNumber_(payload.discount) ? roundMoney_(Number(payload.discount)) : 0;
-    const grandTotal = roundMoney_(Math.max(0, subtotal - discount));
+    const rawLanded = payload.landedCost;
+    if (rawLanded !== undefined && rawLanded !== null && rawLanded !== '' && !isValidNonNegativeNumber_(rawLanded)) {
+      return fail_('Landed cost must be a valid non-negative number.');
+    }
+    const landedCost = isValidNonNegativeNumber_(rawLanded) ? roundMoney_(Number(rawLanded)) : 0;
+    const landedAllocations = allocatePurchaseLandedCosts_(lines, subtotal, landedCost);
+    lines.forEach(function (line, idx) {
+      line.landedShare = landedAllocations[idx].landedShare;
+      line.landedUnitCost = landedAllocations[idx].landedUnitCost;
+    });
+    const grandTotal = roundMoney_(Math.max(0, subtotal - discount) + landedCost);
     let paidAmount = isValidNonNegativeNumber_(payload.paidAmount) ? roundMoney_(Number(payload.paidAmount)) : 0;
     if (paidAmount > grandTotal) paidAmount = grandTotal;
     const dueAmount = roundMoney_(grandTotal - paidAmount);
@@ -222,6 +263,7 @@ function createPurchase(token, payload) {
     appendRow_('PURCHASES', {
       'Purchase ID': purchaseId, 'Date': dateStr, 'Supplier ID': payload.supplierId,
       'Supplier Name': supplierRow['Supplier Name'], 'Subtotal': subtotal, 'Discount': discount,
+      'Landed Cost': landedCost,
       'Grand Total': grandTotal, 'Paid Amount': paidAmount, 'Due Amount': dueAmount,
       'Payment Status': paymentStatus, 'Notes': sanitizeInput_(payload.notes),
       'Payment Method': paymentMethod, 'Bank Account ID': bankAccountId, 'Bank Account Name': bankAccountName,
@@ -246,20 +288,21 @@ function createPurchase(token, payload) {
     lines.forEach(function (line) {
       purchaseItemRows.push({
         'Purchase ID': purchaseId, 'Product ID': line.productId, 'Product Name': line.name,
-        'Quantity': line.qty, 'Unit Price': line.price, 'Sell Price': line.sellPrice, 'Line Total': line.lineTotal
+        'Quantity': line.qty, 'Unit Price': line.price, 'Sell Price': line.sellPrice, 'Line Total': line.lineTotal,
+        'Landed Cost': line.landedShare, 'Landed Unit Cost': line.landedUnitCost
       });
 
       const productUpdate = { 'Current Stock': line.newStock, 'Selling Price': line.sellPrice, 'Updated At': now };
       const latestPurDate = latestPurDateByProduct[line.productId] || '';
       if (!latestPurDate || dateStr >= latestPurDate) {
-        productUpdate['Purchase Price'] = line.price;
+        productUpdate['Purchase Price'] = roundMoney_(line.landedUnitCost);
       }
       updateRowFields_('PRODUCTS', line.rowIndex, productUpdate);
 
       // dateStr, not now() — a backdated purchase must take its correct
       // place in FIFO order (review item 11). createInboundLot_ settles any
-      // existing OVERSOLD debt first and keeps gross Purchase Price on the lot.
-      const lotId = createInboundLot_(line.productId, line.name, purchaseId, dateStr, line.price, line.qty, payload.supplierId, supplierRow['Supplier Name'], line.sellPrice).id;
+      // existing OVERSOLD debt first and capitalizes prorated landed cost into the lot.
+      const lotId = createInboundLot_(line.productId, line.name, purchaseId, dateStr, line.landedUnitCost, line.qty, payload.supplierId, supplierRow['Supplier Name'], line.sellPrice).id;
       stockMovementRows.push({
         'Movement ID': generateId_('STOCK_MOVEMENT'), 'Date': now, 'Product ID': line.productId,
         'Product Name': line.name, 'Type': 'Purchase', 'Reference': purchaseId,

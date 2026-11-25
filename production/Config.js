@@ -231,6 +231,8 @@ const CONFIG = {
       "Payment Method",
       "Bank Account ID",
       "Bank Account Name",
+      // Additive: optional freight/transport/duty charge capitalized into STOCK_LOTS unit cost
+      "Landed Cost",
 ],
     PURCHASE_ITEMS: [
       "Purchase ID",
@@ -240,6 +242,8 @@ const CONFIG = {
       "Unit Price",
       "Sell Price",
       "Line Total",
+      "Landed Cost",
+      "Landed Unit Cost",
     ],
     SALES: [
       "Invoice ID",
