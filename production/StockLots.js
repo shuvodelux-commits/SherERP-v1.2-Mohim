@@ -851,7 +851,9 @@ function planSaleReturnRestoration_(invoiceId, productId, productName, qty, opti
     productName: productName,
     qty: need,
     draws: [],
-    fallbackQty: 0
+    fallbackQty: 0,
+    vendorAbsorbedQty: 0,
+    vendorAbsorbedCost: 0
   };
   if (need <= 0) return plan;
 
@@ -958,6 +960,46 @@ function planSaleReturnRestoration_(invoiceId, productId, productName, qty, opti
       plan.fallbackQty += spill;
     }
     need -= give;
+  }
+
+  if (need > 0) {
+    // Absorb vendor-sourced units back into shop stock at their exact
+    // VENDOR_SOURCING Unit Cost before falling back to product Purchase Price.
+    const vendorRows = (opts.vendorSourcingRows || getAllRows_('VENDOR_SOURCING')).filter(function (v) {
+      return !isDeleted_(v) && v['Invoice ID'] === invoiceId && v['Product ID'] === productId;
+    });
+    if (vendorRows.length) {
+      const vKey = String(invoiceId) + '|' + String(productId);
+      const vAbsMap = virtualState.vendorAbsorbedByKey || (virtualState.vendorAbsorbedByKey = {});
+      if (!Object.prototype.hasOwnProperty.call(vAbsMap, vKey)) {
+        vAbsMap[vKey] = Math.max(0, Number(opts.priorVendorAbsorbedQty) || 0);
+      }
+      let skip = Number(vAbsMap[vKey]) || 0;
+      for (let vi = 0; vi < vendorRows.length && need > 0; vi++) {
+        const vr = vendorRows[vi];
+        let vQty = Number(vr['Quantity']) || 0;
+        if (vQty <= 0) continue;
+        if (skip >= vQty) { skip -= vQty; continue; }
+        if (skip > 0) { vQty -= skip; skip = 0; }
+        const take = Math.min(vQty, need);
+        const vCost = Number(vr['Unit Cost']) || productPrice;
+        plan.draws.push({
+          sourceKind: 'FALLBACK',
+          saleItemLotRowIndex: null,
+          saleItemLotQtyAfter: null,
+          lotId: '',
+          qty: take,
+          purchasePrice: vCost,
+          supplierId: '',
+          vendorAbsorbed: true
+        });
+        plan.fallbackQty += take;
+        plan.vendorAbsorbedQty += take;
+        plan.vendorAbsorbedCost = roundMoney_(plan.vendorAbsorbedCost + take * vCost);
+        vAbsMap[vKey] = (Number(vAbsMap[vKey]) || 0) + take;
+        need -= take;
+      }
+    }
   }
 
   if (need > 0) {

@@ -601,6 +601,11 @@ const CONFIG = {
       // reduces COGS; 'Damaged' skips stock restoration and keeps original COGS
       // so Net Profit reflects the loss.
       "Condition",
+      // Additive: tracks vendor-sourced units absorbed into shop stock by a
+      // Sellable sales return so Profit Reports offset COGS accurately without
+      // mutating immutable VENDOR_SOURCING payable rows.
+      "Vendor Absorbed Qty",
+      "Vendor Absorbed Cost",
     ],
     PURCHASE_RETURN: [
       "Return ID",

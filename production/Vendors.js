@@ -461,7 +461,7 @@ function returnProductsToVendor(token, payload) {
     const txDate = resolveTransactionDate_(token, 'vendors', payload.date, payload.backdatedReason, 'Return');
     const dateStr = txDate.dateStr;
 
-    const plan = planStockConsumption_(sourcing['Product ID'], qty, null, product);
+    const plan = planVendorReturnStockConsumption_(sourcing, qty, product);
     if (plan.shortfall > 0) {
       return fail_('Stock lots do not contain enough physical stock for this vendor return.');
     }
@@ -499,6 +499,73 @@ function returnProductsToVendor(token, payload) {
   } finally {
     lock.releaseLock();
   }
+}
+
+/**
+ * Plans stock consumption for returnProductsToVendor: prefers active lots
+ * created by Sales Returns of the same source Invoice ID (so customer-returned
+ * vendor-sourced units go back to the vendor at their exact vendor cost without
+ * touching unrelated own-stock lots), then falls back to standard FIFO.
+ */
+function planVendorReturnStockConsumption_(sourcing, qty, product) {
+  const productId = sourcing['Product ID'];
+  const invoiceId = String(sourcing['Invoice ID'] || '');
+  const allLots = getAllRows_('STOCK_LOTS');
+  let need = Number(qty) || 0;
+  const draws = [];
+  const usedLotIds = {};
+
+  if (invoiceId && need > 0) {
+    const returnIds = {};
+    activeRows_('SALES_RETURN').forEach(function (r) {
+      if (String(r['Invoice ID'] || '') === invoiceId) returnIds[String(r['Return ID'] || '')] = true;
+    });
+    const returnLots = allLots.filter(function (l) {
+      return l['Product ID'] === productId &&
+        (Number(l['Remaining Quantity']) || 0) > 0 &&
+        String(l['Status'] || '').toLowerCase() !== 'deleted' &&
+        returnIds[String(l['Purchase ID'] || '')];
+    }).sort(compareLotsFifo_);
+
+    for (let i = 0; i < returnLots.length && need > 0; i++) {
+      const lot = returnLots[i];
+      const avail = Number(lot['Remaining Quantity']) || 0;
+      const take = Math.min(avail, need);
+      if (take <= 0) continue;
+      draws.push({
+        lotId: lot['Lot ID'],
+        rowIndex: lot._rowIndex,
+        take: take,
+        unitCost: Number(lot['Purchase Price']) || 0,
+        unitSellPrice: lotSellPrice_(lot, product),
+        remainingAfter: avail - take
+      });
+      usedLotIds[String(lot['Lot ID'])] = true;
+      need -= take;
+    }
+  }
+
+  if (need > 0) {
+    const remainingLots = allLots.filter(function (l) { return !usedLotIds[String(l['Lot ID'])]; });
+    const fifo = planStockConsumption_(productId, need, remainingLots, product);
+    fifo.draws.forEach(function (d) { draws.push(d); });
+    return {
+      productId: productId,
+      draws: draws,
+      shortfall: fifo.shortfall,
+      fallbackPrice: fifo.fallbackPrice,
+      fallbackSellPrice: fifo.fallbackSellPrice,
+      fallbackName: fifo.fallbackName
+    };
+  }
+  return {
+    productId: productId,
+    draws: draws,
+    shortfall: 0,
+    fallbackPrice: 0,
+    fallbackSellPrice: product ? Number(product['Selling Price']) || 0 : 0,
+    fallbackName: product ? product['Product Name'] : ''
+  };
 }
 
 /**

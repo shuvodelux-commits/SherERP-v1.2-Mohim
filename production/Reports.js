@@ -737,7 +737,7 @@ function computeProfit_(range) {
     b.revenue += grossLineTotal * factorByInvoice[id];
   });
 
-  let returnedTotal = 0;
+  let returnedTotal = 0, vendorAbsorbedCogs = 0;
   activeSalesReturnItems_().forEach(function (ri) {
     const id = ri['Invoice ID'];
     if (!inScope[id]) return;
@@ -748,6 +748,15 @@ function computeProfit_(range) {
     addInvoiceProductQty_(netQtyByInvoiceProduct, id, ri['Product ID'], -(Number(ri['Return Quantity']) || 0));
     b.revenue -= scaled;
     returnedTotal += scaled;
+    const vAbsCost = Number(ri['Vendor Absorbed Cost']) || 0;
+    const vAbsQty = Number(ri['Vendor Absorbed Qty']) || 0;
+    if (vAbsCost > 0) {
+      vendorAbsorbedCogs += vAbsCost;
+      b.cost -= vAbsCost;
+    }
+    if (vAbsQty > 0) {
+      addInvoiceProductQty_(costQtyByInvoiceProduct, id, ri['Product ID'], -vAbsQty);
+    }
   });
 
   // SALE_ITEM_LOTS.Quantity is already net of returns (restoreStockToLots_
@@ -777,6 +786,7 @@ function computeProfit_(range) {
     bucket_(v['Product ID'], v['Product Name']).cost += lineCost;
     addInvoiceProductQty_(costQtyByInvoiceProduct, id, v['Product ID'], qty);
   });
+  cogs -= vendorAbsorbedCogs;
 
   Object.keys(byProduct).forEach(function (pid) {
     byProduct[pid].revenue = roundMoney_(byProduct[pid].revenue);

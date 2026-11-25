@@ -300,7 +300,12 @@ function getInvoiceForReturn(token, invoiceId) {
     const subtotal = Number(sale['Subtotal']) || 0;
     const grandTotal = Number(sale['Grand Total']) || 0;
 
-    const outstandingOwnQty = outstandingSaleOwnStockByProduct_(invoiceId, saleItems, returnItems);
+    const vendorSourcedByProduct = {};
+    activeRows_('VENDOR_SOURCING').forEach(function (v) {
+      if (v['Invoice ID'] !== invoiceId) return;
+      const key = v['Product ID'];
+      vendorSourcedByProduct[key] = (vendorSourcedByProduct[key] || 0) + (Number(v['Quantity']) || 0);
+    });
     const bundleSnapshots = getSaleBundleSnapshot_(invoiceId, getAllRows_('SALE_BUNDLE_COMPONENTS'));
 
     const returnedByProduct = {};
@@ -328,10 +333,8 @@ function getInvoiceForReturn(token, invoiceId) {
     const items = Object.keys(soldByProduct).map(function (key) {
       const si = soldByProduct[key];
       const already = returnedByProduct[key] || 0;
-      const available = bundleSnapshots[key]
-        ? Math.max(0, si.soldQty - already)
-        : Math.min(Math.max(0, si.soldQty - already), outstandingOwnQty[key] || 0);
-      const vendorSourced = Math.max(0, si.soldQty - already - available);
+      const available = Math.max(0, si.soldQty - already);
+      const vendorSourced = vendorSourcedByProduct[key] || 0;
       const grossUnitPrice = si.soldQty > 0 ? si.grossValue / si.soldQty : si.unitPrice;
       const effectiveUnitPrice = effectiveTransactionUnitPrice_(grossUnitPrice, subtotal, grandTotal);
       return {
@@ -436,12 +439,14 @@ function prepareSalesReturn_(payload, options) {
 
   const returnedByProduct = {};
   const returnedValueByProduct = {};
+  const priorVendorAbsorbedByProduct = {};
   returnItemsSoFar.forEach(function (ri) {
     const productId = ri['Product ID'];
     returnedByProduct[productId] = (returnedByProduct[productId] || 0) + (Number(ri['Return Quantity']) || 0);
     returnedValueByProduct[productId] = roundMoney_(
       (returnedValueByProduct[productId] || 0) + economicReturnLineAmount_(ri, saleSubtotal, saleGrandTotal)
     );
+    priorVendorAbsorbedByProduct[productId] = (priorVendorAbsorbedByProduct[productId] || 0) + (Number(ri['Vendor Absorbed Qty']) || 0);
   });
 
   let totalReturnAmount = 0;
@@ -457,9 +462,7 @@ function prepareSalesReturn_(payload, options) {
 
     const alreadyReturned = returnedByProduct[item.productId] || 0;
     if (bundleSnapshots[item.productId] && !Number.isSafeInteger(qty)) throw new Error('Bundle return quantity must be whole sets.');
-    const available = bundleSnapshots[item.productId]
-      ? Math.max(0, soldRow.soldQty - alreadyReturned)
-      : Math.min(Math.max(0, soldRow.soldQty - alreadyReturned), outstandingOwnQty[item.productId] || 0);
+    const available = Math.max(0, soldRow.soldQty - alreadyReturned);
     if (qty > available) throw new Error(soldRow.name + ': only ' + available + ' available to return.');
 
     const grossUnitPrice = soldRow.soldQty > 0 ? soldRow.grossValue / soldRow.soldQty : soldRow.unitPrice;
@@ -478,6 +481,7 @@ function prepareSalesReturn_(payload, options) {
     const storedUnitPrice = qty > 0 ? lineTotal / qty : 0;
     totalReturnAmount = roundMoney_(totalReturnAmount + lineTotal);
     const condition = normalizeSalesReturnCondition_(item.condition);
+    const priorOrig = opts.priorOriginalItemsByProduct && opts.priorOriginalItemsByProduct[String(item.productId)];
     return {
       productId: item.productId,
       name: soldRow.name,
@@ -485,7 +489,9 @@ function prepareSalesReturn_(payload, options) {
       price: storedUnitPrice,
       lineTotal: lineTotal,
       productType: bundleSnapshots[item.productId] ? 'Bundle' : 'Standard',
-      condition: condition
+      condition: condition,
+      vendorAbsorbedQty: (opts.skipPhysicalRestoration && priorOrig) ? (Number(priorOrig['Vendor Absorbed Qty']) || 0) : 0,
+      vendorAbsorbedCost: (opts.skipPhysicalRestoration && priorOrig) ? (Number(priorOrig['Vendor Absorbed Cost']) || 0) : 0
     };
   });
 
@@ -528,14 +534,24 @@ function prepareSalesReturn_(payload, options) {
       sourceSaleProductId:v.sourceSaleProductId,rowIndex:product._rowIndex,newStock:newStock};
   });
   const restorationVirtualState = opts.restorationVirtualState || {};
+  const validatedByProduct = {};
+  validated.forEach(function (v) { validatedByProduct[String(v.productId)] = v; });
   const restorationPlans = (opts.skipPhysicalRestoration ? [] : physicalRestorations).map(function(v){
     const product = productsById[v.productId];
-    return planSaleReturnRestoration_(payload.invoiceId,v.productId,product['Product Name'],v.qty,{
+    const rPlan = planSaleReturnRestoration_(payload.invoiceId,v.productId,product['Product Name'],v.qty,{
       saleItemLots:opts.consumptionRows,stockLots:opts.stockLots,
       products:opts.products || Object.keys(productsById).map(function(k){return productsById[k];}),
       lotsById:opts.lotsById,virtualState:restorationVirtualState,
-      sourceSaleProductId:v.sourceSaleProductId
+      sourceSaleProductId:v.sourceSaleProductId,
+      vendorSourcingRows:opts.vendorSourcingRows,
+      priorVendorAbsorbedQty:priorVendorAbsorbedByProduct[v.productId] || 0
     });
+    const targetLine = validatedByProduct[String(v.sourceSaleProductId)];
+    if (targetLine && (Number(rPlan.vendorAbsorbedQty) || 0) > 0) {
+      targetLine.vendorAbsorbedQty = (Number(targetLine.vendorAbsorbedQty) || 0) + (Number(rPlan.vendorAbsorbedQty) || 0);
+      targetLine.vendorAbsorbedCost = roundMoney_((Number(targetLine.vendorAbsorbedCost) || 0) + (Number(rPlan.vendorAbsorbedCost) || 0));
+    }
+    return rPlan;
   });
 
   let customerId = sanitizeInput_(sale['Customer ID']);
@@ -632,7 +648,9 @@ function commitPreparedSalesReturn_(prepared, options) {
       'Line Total': v.lineTotal,
       'Pricing Basis': 'NetAfterInvoiceDiscount',
       'Sold Product Type': v.productType || 'Standard',
-      'Condition': v.condition || 'Sellable'
+      'Condition': v.condition || 'Sellable',
+      'Vendor Absorbed Qty': v.vendorAbsorbedQty || 0,
+      'Vendor Absorbed Cost': v.vendorAbsorbedCost || 0
     };
   });
   const stockMovementRows = [];
@@ -1202,6 +1220,8 @@ function prepareSalesReturnChange_(token, returnId, requested, mode) {
         }
       });
     }
+    const priorOriginalItemsByProduct = {};
+    originalItems.forEach(function (i) { priorOriginalItemsByProduct[String(i['Product ID'])] = i; });
     replacement = prepareSalesReturn_({
       invoiceId:invoiceId,items:payload.items,refundMethod:payload.refundMethod,
       reason:payload.reason,notes:payload.notes
@@ -1212,7 +1232,8 @@ function prepareSalesReturnChange_(token, returnId, requested, mode) {
       products:vProducts,productsById:productsById,consumptionRows:vConsumptions,stockLots:vLots,
       vendorSourcingRows:getAllRows_('VENDOR_SOURCING'),
       skipPhysicalRestoration:!needsStockChange,
-      outstandingOwnQtyByProduct:availableOwn
+      outstandingOwnQtyByProduct:availableOwn,
+      priorOriginalItemsByProduct:priorOriginalItemsByProduct
     });
   } else {
     stockUndo = planSalesReturnStockUndo_(id,{});
@@ -1364,7 +1385,9 @@ function updateSalesReturn(token, payload) {
         'Product Name':v.name,'Return Quantity':v.qty,'Return Price':v.price,
         'Line Total':v.lineTotal,'Pricing Basis':'NetAfterInvoiceDiscount',
         'Sold Product Type':v.productType || 'Standard',
-        'Condition':v.condition || 'Sellable'};
+        'Condition':v.condition || 'Sellable',
+        'Vendor Absorbed Qty':v.vendorAbsorbedQty || 0,
+        'Vendor Absorbed Cost':v.vendorAbsorbedCost || 0};
     }));
     updateRowFields_('SALES_RETURN',plan.original._rowIndex,{
       'Date':prepared.dateStr,'Refund Method':prepared.refundMethod,
