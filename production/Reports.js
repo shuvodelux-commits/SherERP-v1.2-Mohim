@@ -1008,11 +1008,15 @@ function getBalanceSheetReport(token) {
       computeProfit_({ from: '1900-01-01', to: '2999-12-31' }).totals.netProfit
     );
 
-    // Opening Balance Equity derived strictly from explicit opening rows
-    let openingCash = 0;
+    // Opening Balance Equity derived strictly from explicit opening rows, plus
+    // explicit Cash Reconciliation ('Day Close Adjustment') entries.
+    let openingCash = 0, cashAdjustments = 0;
     cashRows.forEach(function (r) {
+      const net = (Number(r['Credit']) || 0) - (Number(r['Debit']) || 0);
       if (r['Type'] === 'Session Open' || r['Type'] === 'Historical Opening') {
-        openingCash = roundMoney_(openingCash + (Number(r['Credit']) || 0) - (Number(r['Debit']) || 0));
+        openingCash = roundMoney_(openingCash + net);
+      } else if (r['Type'] === 'Day Close Adjustment') {
+        cashAdjustments = roundMoney_(cashAdjustments + net);
       }
     });
 
@@ -1089,7 +1093,7 @@ function getBalanceSheetReport(token) {
       bankAdjustments = roundMoney_(bankAdjustments + (Number(r['Credit']) || 0) - (Number(r['Debit']) || 0));
     });
 
-    const adjustments = roundMoney_(bankAdjustments + stockAdjustments);
+    const adjustments = roundMoney_(cashAdjustments + bankAdjustments + stockAdjustments);
     const totalEquity = roundMoney_(ownerCapital + retainedEarnings + openingBalanceEquity + adjustments);
     const totalLiabilitiesAndEquity = roundMoney_(totalLiabilities + totalEquity);
     const difference = roundMoney_(totalAssets - totalLiabilitiesAndEquity);
