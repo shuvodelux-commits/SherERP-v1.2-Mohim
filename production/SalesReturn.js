@@ -1500,3 +1500,192 @@ function deleteSalesReturn(token, returnId, reason, operationId, expectedVersion
     return fail_(err.message);
   } finally {lock.releaseLock();}
 }
+
+/**
+ * Guided Product Exchange: atomically validates both legs (Sales Return +
+ * Replacement Sale) before writing anything, then posts the linked return and
+ * replacement invoice so only the net price difference moves Cash/Bank/Due
+ * while preserving exact FIFO COGS on both legs.
+ *
+ * payload = {
+ *   invoiceId,
+ *   returnItems: [{ productId, name, qty, price, condition }],
+ *   replacementItems: [{ productId, name, qty, unitPrice, priceMode }],
+ *   replacementDiscount (optional),
+ *   paidDifference (optional, when replacementTotal > returnTotal),
+ *   paymentMethod (optional: 'Cash' | 'Bank' | 'Mobile Banking'),
+ *   bankAccountId (optional),
+ *   refundDiffMethod (optional: 'Store Credit' | 'Cash', when replacementTotal < returnTotal),
+ *   date (optional), backdatedReason (optional), reason, notes
+ * }
+ */
+function completeExchange(token, payload) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(CONFIG.LOCK_TIMEOUT_MS);
+  try {
+    const actingUser = requirePermission_(token, 'returns', 'add');
+    requirePermission_(token, 'pos', 'add');
+    requireActiveCashSession_();
+    payload = payload || {};
+
+    if (!payload.invoiceId) return fail_('No invoice selected.');
+    if (!Array.isArray(payload.returnItems) || !payload.returnItems.length) {
+      return fail_('Select at least one product to return.');
+    }
+    if (!Array.isArray(payload.replacementItems) || !payload.replacementItems.length) {
+      return fail_('Add at least one replacement product.');
+    }
+
+    const txDate = resolveTransactionDate_(token, 'returns', payload.date, payload.backdatedReason, 'Exchange');
+    const dateStr = txDate.dateStr;
+
+    // 1. Validate replacement items & chronological FIFO before any write
+    const productsById = {};
+    activeRows_('PRODUCTS').forEach(function (p) { productsById[p['Product ID']] = p; });
+    const allLots = getAllRows_('STOCK_LOTS');
+    const seenRep = {};
+    let replacementSubtotal = 0;
+    const cleanedReplacementItems = payload.replacementItems.map(function (item, idx) {
+      const qty = Number(item && item.qty);
+      if (!isValidNonNegativeNumber_(qty) || qty <= 0) {
+        throw new Error('Replacement line ' + (idx + 1) + ': quantity must be greater than zero.');
+      }
+      const productId = sanitizeInput_(item && item.productId);
+      const product = productsById[productId];
+      if (!product) throw new Error('Replacement product ' + ((item && item.name) || productId) + ' no longer exists.');
+      if (seenRep[productId]) throw new Error(product['Product Name'] + ' appears more than once in replacement items.');
+      seenRep[productId] = true;
+
+      const priceMode = item.priceMode === 'auto' ? 'auto' : 'manual';
+      let unitPrice = Number(item.unitPrice);
+      if (priceMode === 'manual') {
+        if (!isValidNonNegativeNumber_(unitPrice)) {
+          throw new Error('Replacement line ' + (idx + 1) + ': price must be a valid number.');
+        }
+      } else {
+        unitPrice = Number(product['Selling Price']) || 0;
+      }
+      const isBundle = bundleProductType_(product) === 'Bundle';
+      if (!isBundle) {
+        const plan = planStockConsumption_(productId, qty, allLots, product, dateStr);
+        assertSalePlanChronology_(plan, product['Product Name'], dateStr);
+        if (priceMode === 'auto') {
+          unitPrice = computePlanSellingPrice_(plan, qty).unitPrice;
+        }
+      }
+      replacementSubtotal = roundMoney_(replacementSubtotal + roundMoney_(qty * unitPrice));
+      return {
+        productId: productId,
+        name: product['Product Name'],
+        qty: qty,
+        unitPrice: unitPrice,
+        priceMode: priceMode
+      };
+    });
+
+    const replacementDiscount = isValidNonNegativeNumber_(payload.replacementDiscount)
+      ? roundMoney_(Number(payload.replacementDiscount))
+      : 0;
+    const replacementTotal = roundMoney_(Math.max(0, replacementSubtotal - replacementDiscount));
+
+    // 2. Validate Return leg (writes nothing)
+    const refundDiffMethod = payload.refundDiffMethod === 'Cash' ? 'Cash' : 'Store Credit';
+    const baseNote = sanitizeInput_(payload.notes);
+    const preparedReturn = prepareSalesReturn_({
+      invoiceId: payload.invoiceId,
+      items: payload.returnItems,
+      refundMethod: 'Store Credit',
+      reason: sanitizeInput_(payload.reason) || 'Product Exchange',
+      notes: baseNote ? ('Exchange — ' + baseNote) : 'Product Exchange'
+    }, { txDate: txDate });
+
+    const returnTotal = roundMoney_(preparedReturn.totalReturnAmount);
+    const netDifference = roundMoney_(replacementTotal - returnTotal);
+
+    // 3. Determine exact settlement on both legs so Cash/Bank/Due reflect only netDifference
+    let salePaymentType = 'Due';
+    let salePaidAmount = 0;
+    let salePaymentMethod = '';
+    let saleBankAccountId = '';
+
+    if (netDifference > 0) {
+      const paidDiff = isValidNonNegativeNumber_(payload.paidDifference)
+        ? roundMoney_(Number(payload.paidDifference))
+        : 0;
+      if (paidDiff > netDifference + 0.004) {
+        return fail_('Paid difference (' + paidDiff + ') cannot exceed net difference (' + netDifference + ').');
+      }
+      if (paidDiff > 0) {
+        salePaymentMethod = sanitizeInput_(payload.paymentMethod) || 'Cash';
+        const bank = resolveBankAccount_(salePaymentMethod, payload.bankAccountId);
+        saleBankAccountId = bank.id;
+        salePaidAmount = paidDiff;
+        salePaymentType = (Math.abs(paidDiff - replacementTotal) < 0.004) ? 'Cash' : 'Partial';
+      } else {
+        salePaymentType = 'Due';
+      }
+    } else if (netDifference < 0 && refundDiffMethod === 'Cash') {
+      // Cash downgrade: return pays Cash (-returnTotal), replacement collects Cash (+replacementTotal)
+      // => Net Cash = -(returnTotal - replacementTotal), Customer Due unchanged.
+      preparedReturn.refundMethod = 'Cash';
+      salePaymentType = 'Cash';
+      salePaymentMethod = 'Cash';
+      salePaidAmount = replacementTotal;
+    } else {
+      // Even exchange or Store Credit downgrade:
+      // Leg 1 Store Credit (-returnTotal), Leg 2 Due (+replacementTotal) => net Due delta = netDifference.
+      preparedReturn.refundMethod = 'Store Credit';
+      salePaymentType = 'Due';
+    }
+
+    // 4. Write Phase: Commit Leg 1 (Return) then Leg 2 (Replacement Sale)
+    const now = new Date();
+    const returnId = generateId_('SALES_RETURN');
+    const returnResult = commitPreparedSalesReturn_(preparedReturn, {
+      returnId: returnId,
+      now: now,
+      actingUser: actingUser
+    });
+
+    const salePayload = {
+      customerId: returnResult.customerId || preparedReturn.sale['Customer ID'] || '',
+      customerName: preparedReturn.sale['Customer Name'],
+      customerPhone: preparedReturn.sale['Customer Phone'],
+      customerAddress: preparedReturn.sale['Customer Address'] || '',
+      items: cleanedReplacementItems,
+      discount: replacementDiscount,
+      paymentType: salePaymentType,
+      paidAmount: salePaidAmount,
+      paymentMethod: salePaymentMethod || 'Cash',
+      bankAccountId: saleBankAccountId,
+      date: dateStr,
+      backdatedReason: txDate.reason || sanitizeInput_(payload.backdatedReason)
+    };
+    const saleRes = completeSale(token, salePayload);
+    if (!saleRes || !saleRes.success) {
+      throw new Error((saleRes && saleRes.message) || 'Replacement sale failed after return was posted. Needs Review.');
+    }
+
+    // Cross-reference replacement invoice ID on the return header Notes
+    const returnRowIdx = findRowIndex_('SALES_RETURN', 'Return ID', returnId);
+    if (returnRowIdx >= 2) {
+      const linkedNote = (preparedReturn.notes ? preparedReturn.notes + ' ' : '') + '(Replacement: ' + saleRes.invoiceId + ')';
+      updateRowFields_('SALES_RETURN', returnRowIdx, { 'Notes': linkedNote });
+    }
+
+    return ok_({
+      returnId: returnId,
+      invoiceId: saleRes.invoiceId,
+      returnTotal: returnTotal,
+      replacementTotal: replacementTotal,
+      netDifference: netDifference,
+      returnRefundMethod: preparedReturn.refundMethod,
+      salePaymentType: salePaymentType
+    });
+  } catch (err) {
+    logError_('completeExchange', err);
+    return fail_(err.message);
+  } finally {
+    lock.releaseLock();
+  }
+}

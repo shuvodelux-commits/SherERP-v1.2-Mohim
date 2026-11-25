@@ -88,8 +88,58 @@
       <div id="rtBackdatedReasonRow" class="full" style="display:none;"><label>Reason for Backdating *</label><input id="rtBackdatedReason" type="text" placeholder="Why is this dated in the past?"></div>
     </div>
 
+    <div style="margin-top:16px; padding-top:12px; border-top:1px solid var(--color-border);">
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:600;">
+        <input type="checkbox" id="rtExchangeToggle" style="width:auto;">
+        Exchange for Replacement Item(s) <span class="bn-hint" style="display:inline;">— বদলি মাল দিন</span>
+      </label>
+      <div id="rtExchangePanel" hidden style="margin-top:12px; padding:12px; background:var(--color-surface-2, #f8fafc); border:1px solid var(--color-border); border-radius:8px;">
+        <div class="form-grid" style="margin-bottom:10px;">
+          <div>
+            <label>Replacement Product</label>
+            <select id="rtExProduct"><option value="">Loading products...</option></select>
+          </div>
+          <div>
+            <label>Qty</label>
+            <input id="rtExQty" type="number" min="1" step="1" value="1">
+          </div>
+          <div>
+            <label>Unit Price</label>
+            <input id="rtExPrice" type="number" min="0" step="0.01" value="0">
+          </div>
+          <div style="display:flex; align-items:flex-end;">
+            <button type="button" class="btn btn-primary" id="rtExAddBtn" style="width:100%;">+ Add Replacement</button>
+          </div>
+        </div>
+        <div id="rtExCartWrap"></div>
+        <div id="rtExSettleGrid" class="form-grid" style="margin-top:10px;" hidden>
+          <div id="rtExPaidDiffWrap" hidden>
+            <label>Customer Pays Difference Now</label>
+            <input id="rtExPaidDiff" type="number" min="0" step="0.01" value="0">
+          </div>
+          <div id="rtExPayMethodWrap" hidden>
+            <label>Payment Method</label>
+            <select id="rtExPayMethod">
+              <option value="Cash">Cash</option>
+              <option value="Bank">Bank</option>
+              <option value="Mobile Banking">Mobile Banking</option>
+            </select>
+          </div>
+          <div id="rtExRefundDiffWrap" hidden>
+            <label>Refund Extra Credit Via</label>
+            <select id="rtExRefundDiffMethod">
+              <option value="Store Credit">Store Credit (Adjust Customer Due)</option>
+              <option value="Cash">Cash Refund</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div style="max-width:320px; margin-left:auto; margin-top:14px;">
       <div class="totals-row grand"><span>Total Return Amount</span><span class="v" id="rtTotalReturn">0</span></div>
+      <div class="totals-row" id="rtExTotalRow" hidden><span>Replacement Total</span><span class="v" id="rtExTotalVal">0</span></div>
+      <div class="totals-row grand" id="rtExDiffRow" hidden><span id="rtExDiffLabel">Net Difference</span><span class="v" id="rtExDiffVal">0</span></div>
     </div>
 
     <div class="field-error" id="rtFormError"></div>
@@ -117,6 +167,8 @@
     selectedInvoiceCustomerId: '',
     batchInvoices: [],
     batchMode: false,
+    exchangeItems: [],
+    exchangeProducts: null,
     returnOperationId: '', returnAttemptFingerprint: ''
   };
 
@@ -761,6 +813,56 @@
       errEl.style.display = 'block';
       return;
     }
+    var isExchange = !!document.getElementById('rtExchangeToggle').checked;
+    if (isExchange) {
+      if (!rtState.exchangeItems.length) {
+        errEl.textContent = 'Add at least one replacement product for this exchange.';
+        errEl.style.display = 'block';
+        return;
+      }
+      var retTotal = rtReturnTotal_();
+      var repTotal = rtExTotal_();
+      var diff = repTotal - retTotal;
+      var exPayload = {
+        invoiceId: rtState.invoice.invoiceId,
+        returnItems: items,
+        replacementItems: rtState.exchangeItems.map(function (r) {
+          return { productId: r.productId, name: r.name, qty: r.qty, unitPrice: r.unitPrice, priceMode: 'manual' };
+        }),
+        paidDifference: diff > 0 ? (Number(document.getElementById('rtExPaidDiff').value) || 0) : 0,
+        paymentMethod: document.getElementById('rtExPayMethod').value || 'Cash',
+        refundDiffMethod: document.getElementById('rtExRefundDiffMethod').value || 'Store Credit',
+        reason: document.getElementById('rtReason').value.trim() || 'Product Exchange',
+        notes: document.getElementById('rtNote').value.trim(),
+        date: rtDate,
+        backdatedReason: rtBackdatedReason
+      };
+      runConfirmedAction({
+        type: 'financial',
+        title: 'Complete Product Exchange?',
+        message: 'This will post the Sales Return and Replacement Sale together.',
+        details: [
+          { label: 'Original Invoice', value: rtState.invoice.invoiceId, emphasis: true },
+          { label: 'Return Total', value: formatMoney(retTotal) },
+          { label: 'Replacement Total', value: formatMoney(repTotal), emphasis: true },
+          { label: 'Net Difference', value: formatMoney(diff), emphasis: true },
+          { label: 'Date', value: exPayload.date }
+        ],
+        confirmLabel: 'Complete Exchange',
+        loadingLabel: 'Exchanging...',
+        trigger: document.getElementById('rtCompleteBtn')
+      }, function () {
+        return withLoader(serverCall('completeExchange', authToken, exPayload)).then(function (res) {
+          showToast('Exchange complete: ' + res.returnId + ' → ' + res.invoiceId, 'success');
+          rtState.exchangeItems = [];
+          document.getElementById('rtExchangeToggle').checked = false;
+          document.getElementById('rtExchangePanel').hidden = true;
+          rtReset_();
+        });
+      }).catch(function (err) { errEl.textContent = err.message; errEl.style.display = 'block'; });
+      return;
+    }
+
     var payloadSingle = {
       invoiceId: rtState.invoice.invoiceId,
       items: items,
@@ -802,6 +904,83 @@
         rtReset_();
       });
     }).catch(function (err) { errEl.textContent = err.message; errEl.style.display = 'block'; });
+  });
+
+  function rtExTotal_() {
+    return (rtState.exchangeItems || []).reduce(function (s, r) {
+      return s + (Number(r.qty) || 0) * (Number(r.unitPrice) || 0);
+    }, 0);
+  }
+
+  function rtExRender_() {
+    var on = !!document.getElementById('rtExchangeToggle').checked;
+    document.getElementById('rtExchangePanel').hidden = !on;
+    document.getElementById('rtExTotalRow').hidden = !on;
+    document.getElementById('rtExDiffRow').hidden = !on;
+    document.getElementById('rtCompleteBtn').textContent = on ? 'Complete Exchange' : (rtState.editingReturnId ? 'Save Return Changes' : 'Complete Return');
+    if (!on) return;
+
+    var wrap = document.getElementById('rtExCartWrap');
+    if (!rtState.exchangeItems.length) {
+      wrap.innerHTML = '<div class="stat-label">No replacement items added yet.</div>';
+    } else {
+      wrap.innerHTML = '<table style="width:100%; font-size:13px;"><thead><tr><th>Replacement Item</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Total</th><th></th></tr></thead><tbody>' +
+        rtState.exchangeItems.map(function (r, idx) {
+          return '<tr><td>' + escapeHtml(r.name) + '</td><td class="num">' + r.qty + '</td><td class="num">' + formatMoney(r.unitPrice) + '</td><td class="num">' + formatMoney(r.qty * r.unitPrice) + '</td><td class="num"><button type="button" class="btn btn-sm" data-ex-rm="' + idx + '">✕</button></td></tr>';
+        }).join('') + '</tbody></table>';
+      wrap.querySelectorAll('[data-ex-rm]').forEach(function (b) {
+        b.addEventListener('click', function () {
+          rtState.exchangeItems.splice(Number(b.dataset.exRm), 1);
+          rtExRender_();
+        });
+      });
+    }
+
+    var retTotal = rtReturnTotal_();
+    var repTotal = rtExTotal_();
+    var diff = Math.round((repTotal - retTotal) * 100) / 100;
+    document.getElementById('rtExTotalVal').textContent = formatMoney(repTotal);
+    document.getElementById('rtExDiffLabel').textContent = diff > 0 ? 'Customer Pays Difference' : (diff < 0 ? 'Shop Refunds Difference' : 'Even Exchange');
+    document.getElementById('rtExDiffVal').textContent = formatMoney(Math.abs(diff));
+
+    document.getElementById('rtExSettleGrid').hidden = (diff === 0);
+    document.getElementById('rtExPaidDiffWrap').hidden = !(diff > 0);
+    document.getElementById('rtExPayMethodWrap').hidden = !(diff > 0);
+    document.getElementById('rtExRefundDiffWrap').hidden = !(diff < 0);
+    if (diff > 0) document.getElementById('rtExPaidDiff').value = diff.toFixed(2);
+  }
+
+  document.getElementById('rtExchangeToggle').addEventListener('change', function () {
+    var on = this.checked;
+    if (on && !rtState.exchangeProducts) {
+      serverCall('getProductsBootstrap', authToken).then(function (data) {
+        rtState.exchangeProducts = (data && data.products) ? data.products : [];
+        var sel = document.getElementById('rtExProduct');
+        sel.innerHTML = '<option value="">Select replacement product</option>' + rtState.exchangeProducts.map(function (p) {
+          return '<option value="' + escapeHtml(p.id) + '" data-price="' + (Number(p.sellingPrice) || 0) + '">' + escapeHtml(p.name) + ' (Stock: ' + (Number(p.stock) || 0) + ')</option>';
+        }).join('');
+      }).catch(function () {});
+    }
+    rtExRender_();
+  });
+
+  document.getElementById('rtExProduct').addEventListener('change', function () {
+    var opt = this.options[this.selectedIndex];
+    if (opt && opt.dataset.price !== undefined) document.getElementById('rtExPrice').value = opt.dataset.price;
+  });
+
+  document.getElementById('rtExAddBtn').addEventListener('click', function () {
+    var sel = document.getElementById('rtExProduct');
+    var pid = sel.value;
+    if (!pid) return;
+    var prod = (rtState.exchangeProducts || []).filter(function (p) { return p.id === pid; })[0];
+    var qty = Number(document.getElementById('rtExQty').value) || 0;
+    var price = Number(document.getElementById('rtExPrice').value) || 0;
+    if (qty <= 0) return;
+    var existing = rtState.exchangeItems.filter(function (r) { return r.productId === pid; })[0];
+    if (existing) { existing.qty += qty; existing.unitPrice = price; }
+    else rtState.exchangeItems.push({ productId: pid, name: prod ? prod.name : pid, qty: qty, unitPrice: price });
+    rtExRender_();
   });
 
   document.addEventListener('DOMContentLoaded', function () {
