@@ -277,8 +277,9 @@ function updatePurchaseInternal_(token, purchaseId, payload, options) {
       if (product && bundleProductType_(product) === 'Bundle') throw new Error('Bundle stock cannot be purchased; select individual components.');
     });
 
+    const allLotsForUpdate = getAllRows_('STOCK_LOTS');
     const lotByProduct = {};
-    getAllRows_('STOCK_LOTS').forEach(function (l) {
+    allLotsForUpdate.forEach(function (l) {
       if (l['Purchase ID'] === purchaseId) lotByProduct[l['Product ID']] = l;
     });
 
@@ -327,6 +328,9 @@ function updatePurchaseInternal_(token, purchaseId, payload, options) {
       // purchase is already sold), and the first error raised is the one the
       // user reads.
       const lot = lotByProduct[productId];
+      if (delta > 0) {
+        assertPurchaseChronologicalFifo_(productId, product['Product Name'], dateStr, allLotsForUpdate);
+      }
       if (delta < 0) {
         if (!lot) {
           throw new Error(product['Product Name'] + ': this purchase has no stock lot on file, so its quantity cannot be reduced. Use Purchase Return instead.');

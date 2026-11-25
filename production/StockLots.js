@@ -261,23 +261,50 @@ function outstandingSaleOwnStockByProduct_(invoiceId, saleItems, returnItems, co
  * Returns { productId, draws: [{ lotId, rowIndex, take, unitCost,
  * remainingAfter }], shortfall, fallbackPrice, fallbackName }.
  */
-function planStockConsumption_(productId, qty, allLots, productRow) {
+function isOpeningOrLegacyLot_(lot) {
+  const src = String((lot && lot['Purchase ID']) || '').trim().toUpperCase();
+  return src === 'OPENING' || src === 'OPENING-MIGRATION' || src === 'LEGACY' || src.indexOf('OPENING-') === 0;
+}
+
+function lotDateOnly_(lot) {
+  return safeDateOnly_(lot['Purchase Date']) || safeDateOnly_(lot['Created At']) || '';
+}
+
+function planStockConsumption_(productId, qty, allLots, productRow, asOfDate) {
   let need = Number(qty) || 0;
   const product = productRow || getAllRows_('PRODUCTS').filter(function (p) { return p['Product ID'] === productId; })[0];
+  const cutoffDate = asOfDate ? safeDateOnly_(asOfDate) : '';
   const plan = {
     productId: productId, draws: [], shortfall: 0,
+    eligibleAvailable: 0, futureLotCount: 0, earliestFutureLotDate: '',
     fallbackPrice: 0,
     fallbackSellPrice: product ? Number(product['Selling Price']) || 0 : 0,
     fallbackName: product ? product['Product Name'] : ''
   };
   if (need <= 0) return plan;
 
-  const lots = (allLots || getAllRows_('STOCK_LOTS'))
+  const positiveLots = (allLots || getAllRows_('STOCK_LOTS'))
     .filter(function (l) {
       return l['Product ID'] === productId && (Number(l['Remaining Quantity']) || 0) > 0 &&
         String(l['Status'] || '').toLowerCase() !== 'deleted';
     })
     .sort(compareLotsFifo_);
+
+  const lots = [];
+  positiveLots.forEach(function (l) {
+    if (cutoffDate && !isOpeningOrLegacyLot_(l)) {
+      const ld = lotDateOnly_(l);
+      if (ld && ld > cutoffDate) {
+        plan.futureLotCount++;
+        if (!plan.earliestFutureLotDate || ld < plan.earliestFutureLotDate) {
+          plan.earliestFutureLotDate = ld;
+        }
+        return;
+      }
+    }
+    plan.eligibleAvailable += Number(l['Remaining Quantity']) || 0;
+    lots.push(l);
+  });
 
   for (let i = 0; i < lots.length && need > 0; i++) {
     const lot = lots[i];
@@ -310,6 +337,69 @@ function planStockConsumption_(productId, qty, allLots, productRow) {
 }
 
 /**
+ * Blocks a backdated sale when on-or-before-date lots cannot satisfy it while
+ * newer purchase lots already exist (preventing future-lot consumption or
+ * coexisting negative/positive lots).
+ */
+function assertSalePlanChronology_(plan, productName, saleDate) {
+  if (!plan || !saleDate) return;
+  if ((Number(plan.shortfall) || 0) > 0 && (Number(plan.futureLotCount) || 0) > 0) {
+    const avail = Number(plan.eligibleAvailable) || 0;
+    const label = productName || plan.fallbackName || plan.productId;
+    throw new Error(
+      label + ': cannot backdate sale to ' + saleDate + ' — only ' + avail +
+      ' unit(s) were in stock on or before that date, and later purchase lots (earliest ' +
+      plan.earliestFutureLotDate + ') already exist.'
+    );
+  }
+}
+
+/**
+ * Blocks a backdated purchase (or stock addition to an older purchase) when a
+ * newer non-opening lot for the same product has already been consumed by an
+ * active sale, which would silently invalidate that sale's FIFO COGS.
+ */
+function assertPurchaseChronologicalFifo_(productId, productName, purchaseDate, allLots, allSaleItemLots, activeSalesById) {
+  const pDate = safeDateOnly_(purchaseDate);
+  if (!pDate) return;
+  const lots = allLots || getAllRows_('STOCK_LOTS');
+  const newerLotDateById = {};
+  let hasNewerLot = false;
+  lots.forEach(function (l) {
+    if (l['Product ID'] !== productId) return;
+    if (String(l['Status'] || '').toLowerCase() === 'deleted') return;
+    if (String(l['Purchase ID'] || '').trim().toUpperCase() === 'OVERSOLD') return;
+    if (isOpeningOrLegacyLot_(l)) return;
+    const ld = lotDateOnly_(l);
+    if (ld && ld > pDate) {
+      newerLotDateById[String(l['Lot ID'])] = ld;
+      hasNewerLot = true;
+    }
+  });
+  if (!hasNewerLot) return;
+
+  let salesMap = activeSalesById;
+  if (!salesMap) {
+    salesMap = {};
+    activeRows_('SALES').forEach(function (s) { salesMap[String(s['Invoice ID'])] = s; });
+  }
+  const silRows = allSaleItemLots || getAllRows_('SALE_ITEM_LOTS');
+  for (let i = 0; i < silRows.length; i++) {
+    const row = silRows[i];
+    if (row['Product ID'] !== productId) continue;
+    if ((Number(row['Quantity']) || 0) <= 0) continue;
+    const lotDate = newerLotDateById[String(row['Lot ID'] || '')];
+    if (!lotDate) continue;
+    if (!salesMap[String(row['Invoice ID'] || '')]) continue;
+    throw new Error(
+      (productName || productId) + ': cannot backdate purchase to ' + pDate +
+      ' because newer stock lot dated ' + lotDate + ' was already sold on invoice ' +
+      row['Invoice ID'] + ' (FIFO chronology guard).'
+    );
+  }
+}
+
+/**
  * Sale-only planner for a line whose shortage is being sourced from a vendor.
  *
  * Positive lots can temporarily exceed Products.Current Stock when earlier
@@ -321,14 +411,14 @@ function planStockConsumption_(productId, qty, allLots, productRow) {
  * stock sales, returns, purchase returns, delete/reversal and other inventory
  * flows keep their existing lot semantics.
  */
-function planSaleVendorConsumption_(productId, qty, allLots, productRow) {
+function planSaleVendorConsumption_(productId, qty, allLots, productRow, asOfDate) {
   const requested = Number(qty) || 0;
   const product = productRow || getAllRows_('PRODUCTS').filter(function (p) { return p['Product ID'] === productId; })[0];
-  if (requested <= 0) return planStockConsumption_(productId, 0, allLots, product);
+  if (requested <= 0) return planStockConsumption_(productId, 0, allLots, product, asOfDate);
 
   const netOwnedAvailable = Math.max(0, product ? (Number(product['Current Stock']) || 0) : 0);
   const ownTarget = Math.min(requested, netOwnedAvailable);
-  const plan = planStockConsumption_(productId, ownTarget, allLots, product);
+  const plan = planStockConsumption_(productId, ownTarget, allLots, product, asOfDate);
   const ownDrawn = plan.draws.reduce(function (sum, d) { return sum + (Number(d.take) || 0); }, 0);
 
   // Any part of the requested sale that cannot be backed by the shop's NET

@@ -400,6 +400,11 @@ function completeSale(token, payload) {
     const phoneInput = sanitizeInput_(payload.customerPhone);
     if (!nameInput || !phoneInput) return fail_('Customer name and phone are required for every sale.');
 
+    // Resolve transaction date early in validation so chronological FIFO checks
+    // know the exact sale date before planning stock consumption.
+    const txDate = resolveTransactionDate_(token, 'pos', payload.date, payload.backdatedReason, 'Sale');
+    const dateStr = txDate.dateStr;
+
     // ================== VALIDATION PHASE — writes nothing ==================
     // Reads for the whole cart up front, instead of a findRowIndex_ plus a
     // getRange per line.
@@ -459,8 +464,8 @@ function completeSale(token, payload) {
       // generic lot behavior.
       const requestedVendorId = sanitizeInput_(item.vendorId);
       const plan = isBundle ? null : (requestedVendorId
-        ? planSaleVendorConsumption_(item.productId, qty, allLots, product)
-        : planStockConsumption_(item.productId, qty, allLots, product));
+        ? planSaleVendorConsumption_(item.productId, qty, allLots, product, dateStr)
+        : planStockConsumption_(item.productId, qty, allLots, product, dateStr));
       // Automatic sale pricing is server-authoritative. Compute it before a
       // vendor resolution neutralizes plan.shortfall: shortage units still
       // sell at the product's current/default selling price.
@@ -491,6 +496,7 @@ function completeSale(token, payload) {
         vendorTotalCost = roundMoney_(vendorQty * vendorUnitCost);
         plan.shortfall = 0; // neutralized — applyStockConsumption_ only creates an OVERSOLD lot when shortfall > 0, nothing else reads this field
       }
+      if (plan) assertSalePlanChronology_(plan, item.name, dateStr);
 
       const currentStock = Number(product['Current Stock']) || 0;
       let price, lineTotal;
@@ -539,7 +545,8 @@ function completeSale(token, payload) {
         const product = productsById[productId];
         if (!product || bundleProductType_(product) !== 'Standard') throw new Error('Bundle component no longer exists.');
         const qty = demand.requirementsByProductId[productId];
-        const fifoPlan = planStockConsumption_(productId,qty,allLots,product);
+        const fifoPlan = planStockConsumption_(productId, qty, allLots, product, dateStr);
+        assertSalePlanChronology_(fifoPlan, product['Product Name'], dateStr);
         // Preflight the parent allocation before posting any invoice or lot.
         // applyStockConsumption_ later assigns actual OVERSOLD lot IDs.
         const virtualDraws=fifoPlan.draws.map(function(d){return {lotId:d.lotId,qty:d.take,unitCost:d.unitCost,unitSellPrice:d.unitSellPrice};});
@@ -601,11 +608,6 @@ function completeSale(token, payload) {
     if (dueAmount > 0 && customerName === 'Walk-in Customer') {
       throw new Error('A customer name and phone are needed to track this against an account.');
     }
-
-    // Throws on a future date, a malformed date, a missing backdate reason,
-    // or no backdate permission — so it belongs on this side of the line.
-    const txDate = resolveTransactionDate_(token, 'pos', payload.date, payload.backdatedReason, 'Sale');
-    const dateStr = txDate.dateStr;
 
     // ======================== WRITE PHASE ========================
     // Nothing below here raises a validation error. Apps Script has no

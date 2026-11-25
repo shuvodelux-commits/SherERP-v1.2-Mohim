@@ -198,6 +198,13 @@ function createPurchase(token, payload) {
     const bankAccount = resolveBankAccount_(paymentMethod, payload.bankAccountId);
     const bankAccountId = bankAccount.id, bankAccountName = bankAccount.name;
 
+    // Chronological FIFO guard: ensure a backdated purchase does not insert a
+    // lot earlier than a newer lot that has already been sold.
+    const existingLots = getAllRows_('STOCK_LOTS');
+    lines.forEach(function (line) {
+      assertPurchaseChronologicalFifo_(line.productId, line.name, dateStr, existingLots);
+    });
+
     // ======================== WRITE PHASE ========================
     // Nothing below here raises a validation error.
     const purchaseId = generateId_('PURCHASES');
@@ -222,7 +229,6 @@ function createPurchase(token, payload) {
       'Is Backdated': txDate.isBackdated, 'Backdated Days': txDate.backdatedDays, 'Backdated Reason': txDate.reason
     });
 
-    const existingLots = getAllRows_('STOCK_LOTS');
     const latestPurDateByProduct = {};
     existingLots.forEach(function (l) {
       if (String(l['Status'] || '').toLowerCase() === 'deleted') return;

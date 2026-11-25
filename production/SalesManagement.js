@@ -725,7 +725,8 @@ function updateSaleInternal_(token, invoiceId, payload, options) {
         if (oldVendorRow && requestedResolution === 'negative') {
           queueVendorReversal_(oldVendorRow, info.name);
           if (oldVendorQty > 0) {
-            const plan = planStockConsumption_(info.productId, oldVendorQty, planningLots, product);
+            const plan = planStockConsumption_(info.productId, oldVendorQty, planningLots, product, editDate);
+            assertSalePlanChronology_(plan, info.name, editDate);
             stockChanges.push({
               productId: info.productId, name: product['Product Name'], rowIndex: product._rowIndex,
               delta: oldVendorQty, newStock: currentStock - oldVendorQty, plan: plan
@@ -782,8 +783,8 @@ function updateSaleInternal_(token, invoiceId, payload, options) {
       if (lotDelta > 0) {
         // Increasing real stock need — planned now (writes nothing), same as completeSale.
         plan = requestedVendorId
-          ? planSaleVendorConsumption_(info.productId, lotDelta, planningLots, product)
-          : planStockConsumption_(info.productId, lotDelta, planningLots, product);
+          ? planSaleVendorConsumption_(info.productId, lotDelta, planningLots, product, editDate)
+          : planStockConsumption_(info.productId, lotDelta, planningLots, product, editDate);
         if (requestedVendorId) {
           if (plan.shortfall <= 0) throw new Error(info.name + ': there is no shortage on this line to source from a vendor.');
           vendorRow = vendorsById[requestedVendorId];
@@ -796,6 +797,7 @@ function updateSaleInternal_(token, invoiceId, payload, options) {
           newVendorTotalCost = newVendorQty * newVendorUnitCost;
           plan.shortfall = 0; // neutralized — see completeSale in Sales.gs
         }
+        assertSalePlanChronology_(plan, info.name, editDate);
         // else: leave plan.shortfall as-is — becomes an OVERSOLD lot (Negative Stock Sale), same as completeSale's default
       } else if (requestedVendorId) {
         throw new Error(info.name + ': there is no shortage on this line to source from a vendor.');
