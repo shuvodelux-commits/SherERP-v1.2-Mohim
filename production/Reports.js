@@ -945,13 +945,12 @@ function getBalanceSheetReport(token) {
     const cashRows = activeRows_('CASH_BOOK');
     const cash = getCashBalance_(cashRows);
 
-    const bankAccounts = getAllRows_('BANK_ACCOUNTS').filter(function (b) {
-      return b['Status'] !== 'Inactive' || Math.abs(Number(b['Current Balance']) || 0) > 0.004;
-    });
+    const allBankAccounts = getAllRows_('BANK_ACCOUNTS');
     let bank = 0, mobileBanking = 0, openingBank = 0;
-    bankAccounts.forEach(function (b) {
-      const bal = roundMoney_(Number(b['Current Balance']) || 0);
+    allBankAccounts.forEach(function (b) {
       openingBank = roundMoney_(openingBank + (Number(b['Opening Balance']) || 0));
+      if (b['Status'] === 'Inactive' && Math.abs(Number(b['Current Balance']) || 0) <= 0.004) return;
+      const bal = roundMoney_(Number(b['Current Balance']) || 0);
       if (sanitizeAccountType_(b['Account Type']) === 'Mobile Banking') mobileBanking = roundMoney_(mobileBanking + bal);
       else bank = roundMoney_(bank + bal);
     });
@@ -959,19 +958,21 @@ function getBalanceSheetReport(token) {
     const inventory = getInventoryValueAtCost_();
 
     let customerReceivable = 0, customerAdvance = 0, openingCustomerNet = 0;
-    activeRows_('CUSTOMERS').forEach(function (c) {
+    getAllRows_('CUSTOMERS').forEach(function (c) {
+      openingCustomerNet = roundMoney_(openingCustomerNet + (Number(c['Opening Balance']) || 0));
+      if (isDeleted_(c)) return;
       const due = roundMoney_(Number(c['Current Due']) || 0);
       if (due >= 0) customerReceivable = roundMoney_(customerReceivable + due);
       else customerAdvance = roundMoney_(customerAdvance + Math.abs(due));
-      openingCustomerNet = roundMoney_(openingCustomerNet + (Number(c['Opening Balance']) || 0));
     });
 
     let supplierPayable = 0, supplierAdvance = 0, openingSupplierNet = 0;
-    activeRows_('SUPPLIERS').forEach(function (s) {
+    getAllRows_('SUPPLIERS').forEach(function (s) {
+      openingSupplierNet = roundMoney_(openingSupplierNet + (Number(s['Opening Balance']) || 0));
+      if (isDeleted_(s)) return;
       const due = roundMoney_(Number(s['Current Due']) || 0);
       if (due >= 0) supplierPayable = roundMoney_(supplierPayable + due);
       else supplierAdvance = roundMoney_(supplierAdvance + Math.abs(due));
-      openingSupplierNet = roundMoney_(openingSupplierNet + (Number(s['Opening Balance']) || 0));
     });
 
     let vendorPayable = 0, vendorReceivable = 0;
@@ -1132,6 +1133,214 @@ function getBalanceSheetReport(token) {
     });
   } catch (err) {
     logError_('getBalanceSheetReport', err);
+    return fail_(err.message);
+  }
+}
+
+/**
+ * Read-only diagnostic explaining why a live sheet's Balance Sheet is out of
+ * balance (legacy pre-fix rows, missing lot COGS, bank/ledger drift, etc.).
+ */
+function getBalanceSheetDiagnostics(token) {
+  try {
+    requirePermission_(token, 'reports', 'view');
+    const checks = [];
+
+    // 1. Legacy Historical Opening rows in CASH_BOOK
+    const cashRows = activeRows_('CASH_BOOK');
+    let histCashCount = 0, histCashNet = 0;
+    const cashByType = {};
+    cashRows.forEach(function (r) {
+      const t = String(r['Type'] || 'Blank');
+      const net = (Number(r['Credit']) || 0) - (Number(r['Debit']) || 0);
+      if (!cashByType[t]) cashByType[t] = { count: 0, net: 0 };
+      cashByType[t].count++;
+      cashByType[t].net = roundMoney_(cashByType[t].net + net);
+      if (t === 'Historical Opening') { histCashCount++; histCashNet = roundMoney_(histCashNet + net); }
+    });
+    if (histCashCount > 0) {
+      checks.push({
+        category: 'Legacy Historical Opening Cash (BUG-03)',
+        count: histCashCount,
+        amount: histCashNet,
+        detail: 'Run Hardware ERP -> Repair Historical Opening Cash (Preview) in Google Sheet.'
+      });
+    }
+
+    // 2. Unsettled OVERSOLD lots & product stock vs lot mismatch
+    const activeProducts = {};
+    activeRows_('PRODUCTS').forEach(function (p) {
+      if (bundleProductType_(p) !== 'Bundle') activeProducts[p['Product ID']] = p;
+    });
+    const lotQtyByProd = {};
+    let oversoldCount = 0, oversoldVal = 0, unpricedCount = 0, deletedProdLotVal = 0;
+    getAllRows_('STOCK_LOTS').forEach(function (l) {
+      if (String(l['Status'] || '').toLowerCase() === 'deleted') return;
+      const rem = Number(l['Remaining Quantity']) || 0;
+      const price = Number(l['Purchase Price']) || 0;
+      const pid = l['Product ID'];
+      if (!activeProducts[pid]) {
+        if (Math.abs(rem) > 0) deletedProdLotVal = roundMoney_(deletedProdLotVal + rem * price);
+        return;
+      }
+      lotQtyByProd[pid] = (lotQtyByProd[pid] || 0) + rem;
+      if (rem < 0) { oversoldCount++; oversoldVal = roundMoney_(oversoldVal + rem * price); }
+      if (rem !== 0 && price === 0) unpricedCount++;
+    });
+    if (oversoldCount > 0) {
+      checks.push({
+        category: 'Negative / Oversold Stock Lots',
+        count: oversoldCount,
+        amount: oversoldVal,
+        detail: 'Run Hardware ERP -> Repair Oversold Stock Lots (Preview) in Google Sheet.'
+      });
+    }
+    if (unpricedCount > 0) {
+      checks.push({
+        category: 'Zero-Cost Stock Lots (Purchase Price = 0)',
+        count: unpricedCount,
+        amount: 0,
+        detail: 'Lots with stock but 0 cost understate Inventory/COGS.'
+      });
+    }
+    if (Math.abs(deletedProdLotVal) > 0.004) {
+      checks.push({
+        category: 'Non-Zero Lots on Deleted Products',
+        count: 1,
+        amount: deletedProdLotVal,
+        detail: 'Deleted products still hold active lot value.'
+      });
+    }
+
+    let stockMismatchCount = 0, stockMismatchQty = 0;
+    Object.keys(activeProducts).forEach(function (pid) {
+      const p = activeProducts[pid];
+      const cur = Number(p['Current Stock']) || 0;
+      const lotSum = lotQtyByProd[pid] || 0;
+      if (Math.abs(cur - lotSum) > 0.0001) {
+        stockMismatchCount++;
+        stockMismatchQty += (cur - lotSum);
+      }
+    });
+    if (stockMismatchCount > 0) {
+      checks.push({
+        category: 'Product Current Stock != Lot Sum',
+        count: stockMismatchCount,
+        amount: roundMoney_(stockMismatchQty),
+        detail: 'Stock qty differs from STOCK_LOTS remaining across ' + stockMismatchCount + ' product(s).'
+      });
+    }
+
+    // 3. Invoices missing FIFO lot COGS coverage
+    const lifetimeProfit = computeProfit_({ from: '1900-01-01', to: '2999-12-31' });
+    if (lifetimeProfit.coverage.invoicesMissingLotData > 0) {
+      checks.push({
+        category: 'Sales Invoices Missing FIFO Lot COGS',
+        count: lifetimeProfit.coverage.invoicesMissingLotData,
+        amount: 0,
+        detail: lifetimeProfit.coverage.invoicesMissingLotData + ' of ' + lifetimeProfit.coverage.invoicesInRange + ' invoices lack full SALE_ITEM_LOTS rows.'
+      });
+    }
+
+    // 4. Bank Accounts Current Balance vs BANK_BOOK sum
+    const bankBookNet = {};
+    getAllRows_('BANK_BOOK').forEach(function (r) {
+      if (r['Status'] === 'Reversed' && !r['Reversal Of']) {
+        // check if there is a reversal row; skip delete-voided rows
+      }
+      const id = String(r['Bank Account ID'] || '');
+      if (!id) return;
+      // Mirror getBankLedger: count all non-deleted rows (Status='Reversed' rows with a separate Reversal row cancel out; delete-voided rows have Status='Reversed' and NO counterpart)
+    });
+    const allBankBook = getAllRows_('BANK_BOOK');
+    const bankReversalTargets = {};
+    allBankBook.forEach(function (r) { if (r['Reversal Of']) bankReversalTargets[String(r['Reversal Of'])] = true; });
+    allBankBook.forEach(function (r) {
+      const id = String(r['Bank Account ID'] || '');
+      if (!id) return;
+      const manuallyReversed = r['Status'] === 'Reversed' && bankReversalTargets[String(r['Entry ID'] || '')];
+      if (r['Status'] === 'Reversed' && !manuallyReversed) return;
+      if (String(r['Type'] || '') === 'Opening Balance') return;
+      bankBookNet[id] = roundMoney_((bankBookNet[id] || 0) + (Number(r['Credit']) || 0) - (Number(r['Debit']) || 0));
+    });
+    let bankDriftCount = 0, bankDriftTotal = 0;
+    getAllRows_('BANK_ACCOUNTS').forEach(function (b) {
+      const id = String(b['Bank Account ID'] || '');
+      const expected = roundMoney_((Number(b['Opening Balance']) || 0) + (bankBookNet[id] || 0));
+      const actual = roundMoney_(Number(b['Current Balance']) || 0);
+      if (Math.abs(actual - expected) > 0.01) {
+        bankDriftCount++;
+        bankDriftTotal = roundMoney_(bankDriftTotal + (actual - expected));
+      }
+    });
+    if (bankDriftCount > 0) {
+      checks.push({
+        category: 'Bank Current Balance != Bank Book',
+        count: bankDriftCount,
+        amount: bankDriftTotal,
+        detail: bankDriftCount + ' bank account(s) have stored Current Balance differing from Opening + Bank Book.'
+      });
+    }
+
+    // 5. Customer & Supplier Current Due vs Ledger
+    const custLedNet = {};
+    activeRows_('CUSTOMER_LEDGER').forEach(function (l) {
+      if (String(l['Type'] || '') === 'Opening Balance') return;
+      const id = String(l['Customer ID'] || '');
+      custLedNet[id] = roundMoney_((custLedNet[id] || 0) + (Number(l['Debit']) || 0) - (Number(l['Credit']) || 0));
+    });
+    let custDriftCount = 0, custDriftTotal = 0;
+    activeRows_('CUSTOMERS').forEach(function (c) {
+      const id = String(c['Customer ID'] || '');
+      const expected = roundMoney_((Number(c['Opening Balance']) || 0) + (custLedNet[id] || 0));
+      const actual = roundMoney_(Number(c['Current Due']) || 0);
+      if (Math.abs(actual - expected) > 0.01) {
+        custDriftCount++;
+        custDriftTotal = roundMoney_(custDriftTotal + (actual - expected));
+      }
+    });
+    if (custDriftCount > 0) {
+      checks.push({
+        category: 'Customer Current Due != Ledger',
+        count: custDriftCount,
+        amount: custDriftTotal,
+        detail: custDriftCount + ' customer(s) have Current Due differing from Opening + Customer Ledger.'
+      });
+    }
+
+    const supLedNet = {};
+    activeRows_('SUPPLIER_LEDGER').forEach(function (l) {
+      if (String(l['Type'] || '') === 'Opening Balance') return;
+      const id = String(l['Supplier ID'] || '');
+      supLedNet[id] = roundMoney_((supLedNet[id] || 0) + (Number(l['Debit']) || 0) - (Number(l['Credit']) || 0));
+    });
+    let supDriftCount = 0, supDriftTotal = 0;
+    activeRows_('SUPPLIERS').forEach(function (s) {
+      const id = String(s['Supplier ID'] || '');
+      const expected = roundMoney_((Number(s['Opening Balance']) || 0) + (supLedNet[id] || 0));
+      const actual = roundMoney_(Number(s['Current Due']) || 0);
+      if (Math.abs(actual - expected) > 0.01) {
+        supDriftCount++;
+        supDriftTotal = roundMoney_(supDriftTotal + (actual - expected));
+      }
+    });
+    if (supDriftCount > 0) {
+      checks.push({
+        category: 'Supplier Current Due != Ledger',
+        count: supDriftCount,
+        amount: supDriftTotal,
+        detail: supDriftCount + ' supplier(s) have Current Due differing from Opening + Supplier Ledger.'
+      });
+    }
+
+    // 6. Cash Book summary by Type (to spot manual / legacy rows)
+    const cashTypes = Object.keys(cashByType).map(function (t) {
+      return { type: t, count: cashByType[t].count, net: cashByType[t].net };
+    }).sort(function (a, b) { return Math.abs(b.net) - Math.abs(a.net); });
+
+    return ok_({ checks: checks, cashTypes: cashTypes });
+  } catch (err) {
+    logError_('getBalanceSheetDiagnostics', err);
     return fail_(err.message);
   }
 }

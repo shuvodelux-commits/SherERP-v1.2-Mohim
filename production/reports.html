@@ -303,6 +303,10 @@
     <div class="totals-row"><span>Total Assets</span><span class="v" id="rbCheckAssets">--</span></div>
     <div class="totals-row"><span>Total Liabilities + Owner Equity</span><span class="v" id="rbCheckLiabEq">--</span></div>
     <div class="totals-row grand"><span>Status / Difference</span><span class="v" id="rbCheckStatus">--</span></div>
+    <div id="rbDiagWrap" hidden style="margin-top:12px; padding-top:12px; border-top:1px solid var(--color-border);">
+      <button type="button" class="btn btn-sm" id="rbDiagBtn">Diagnose Difference</button>
+      <div id="rbDiagOut" style="margin-top:10px;"></div>
+    </div>
   </div>
 </div>
 
@@ -526,8 +530,30 @@
       document.getElementById('rbCheckStatus').innerHTML = rec.balanced
         ? '<span class="badge badge-success">Balanced (0)</span>'
         : '<span class="badge badge-danger">Out of Balance: ' + escapeHtml(rptMoney_(rec.difference)) + '</span>';
+      document.getElementById('rbDiagWrap').hidden = !!rec.balanced;
+      document.getElementById('rbDiagOut').innerHTML = '';
     });
   }
+
+  document.getElementById('rbDiagBtn').addEventListener('click', function () {
+    withLoader(serverCall('getBalanceSheetDiagnostics', authToken)).then(function (diag) {
+      var out = document.getElementById('rbDiagOut');
+      var html = '';
+      if (diag.checks && diag.checks.length) {
+        html += '<div class="table-scroll"><table><thead><tr><th>Finding</th><th class="num">Count</th><th class="num">Amount</th><th>Detail</th></tr></thead><tbody>' +
+          diag.checks.map(function (c) {
+            return '<tr><td><strong>' + escapeHtml(c.category) + '</strong></td><td class="num">' + c.count + '</td><td class="num">' + escapeHtml(rptMoney_(c.amount)) + '</td><td>' + escapeHtml(c.detail) + '</td></tr>';
+          }).join('') + '</tbody></table></div>';
+      } else {
+        html += '<div class="stat-label">No ledger/lot mismatches found. Check Cash Book types below.</div>';
+      }
+      if (diag.cashTypes && diag.cashTypes.length) {
+        html += '<div style="margin-top:10px; font-size:12px; color:var(--color-text-muted);"><strong>Cash Book by Type:</strong> ' +
+          diag.cashTypes.map(function (t) { return escapeHtml(t.type) + ' (' + t.count + ': ' + escapeHtml(rptMoney_(t.net)) + ')'; }).join(' · ') + '</div>';
+      }
+      out.innerHTML = html;
+    }).catch(function (err) { showToast(err.message, 'error'); });
+  });
 
   var RPT_LOADERS = {
     rptSales: rptLoadSales,
