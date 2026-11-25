@@ -1,0 +1,15 @@
+# Google Apps Script / clasp local config & credentials
+.clasp.json
+.clasp.json.*
+.clasprc.json
+*.backup
+*.old-backup
+
+# Backup archives, local reports & OS/editor artifacts
+*.zip
+mohim_erp_audit_report.md
+.DS_Store
+Thumbs.db
+node_modules/
+.env
+.env.*
