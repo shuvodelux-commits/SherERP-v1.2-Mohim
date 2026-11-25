@@ -1040,6 +1040,8 @@ const CONFIG = {
       "Deleted By",
       "Deleted At",
       "Delete Reason",
+      "Cost Lots",
+      "Total Cost",
 ],
     // Settles a Receivable with stock instead of cash — the vendor brings
     // products back to us. The mirror image of VENDOR_RETURNS: always

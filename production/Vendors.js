@@ -600,12 +600,16 @@ function giveProductsToVendor(token, payload) {
       });
 
       const issueId = issueIds[itemIndex];
+      const costEntries = consumption.map(function (c) {
+        return { lotId: c.lotId || '', qty: Number(c.qty) || 0, unitCost: Number(c.unitCost) || 0 };
+      });
       appendRow_('VENDOR_ISSUES', {
         'Issue ID': issueId, 'Memo ID': memoId, 'Date': dateStr,
         'Vendor ID': vendor['Vendor ID'], 'Vendor Name': vendor['Vendor Name'],
         'Product ID': product['Product ID'], 'Product Name': product['Product Name'],
         'Quantity': qty, 'Unit Value': item.unitValue, 'Total Value': item.lineTotal,
-        'Notes': memoNote, 'Created By': actorName_(actingUser), 'Created At': now
+        'Notes': memoNote, 'Created By': actorName_(actingUser), 'Created At': now,
+        'Cost Lots': formatVendorCostLots_(costEntries), 'Total Cost': totalVendorCostLots_(costEntries)
       });
 
       // Keep one ledger row per Issue ID for compatibility with the existing
@@ -690,6 +694,89 @@ function receiveVendorPayment(token, vendorId, amount, method, bankAccountId, no
 }
 
 /**
+ * Serializes/parses FIFO cost slices consumed by a VENDOR_ISSUES row so
+ * returns, edits, and deletions restore exact original FIFO lot costs instead
+ * of arbitrary vendor billing values.
+ * Format: "LOT-000001:3:100|LOT-000002:2:140"
+ */
+function parseVendorCostLots_(text) {
+  return String(text || '').split('|').map(function (part) {
+    const f = part.split(':');
+    if (f.length < 3) return null;
+    const qty = Number(f[1]);
+    const unitCost = Number(f[2]);
+    return qty > 0 && isFinite(unitCost) ? { lotId: f[0] || '', qty: qty, unitCost: unitCost } : null;
+  }).filter(function (e) { return !!e; });
+}
+
+function formatVendorCostLots_(entries) {
+  return (entries || []).filter(function (e) { return (Number(e.qty) || 0) > 0; }).map(function (e) {
+    return (e.lotId || '') + ':' + Number(e.qty) + ':' + Number(e.unitCost || 0);
+  }).join('|');
+}
+
+function totalVendorCostLots_(entries) {
+  let sum = 0;
+  (entries || []).forEach(function (e) {
+    sum += (Number(e.qty) || 0) * (Number(e.unitCost) || 0);
+  });
+  return roundMoney_(sum);
+}
+
+function sliceVendorCostLots_(entries, offsetQty, takeQty, fallbackUnitCost) {
+  let skip = Math.max(0, Number(offsetQty) || 0);
+  let need = Math.max(0, Number(takeQty) || 0);
+  const out = [];
+  (entries || []).forEach(function (e) {
+    if (need <= 0) return;
+    let q = Number(e.qty) || 0;
+    if (q <= 0) return;
+    if (skip >= q) { skip -= q; return; }
+    if (skip > 0) { q -= skip; skip = 0; }
+    const take = Math.min(q, need);
+    out.push({ lotId: e.lotId || '', qty: take, unitCost: Number(e.unitCost) || 0 });
+    need -= take;
+  });
+  if (need > 0) {
+    out.push({ lotId: '', qty: need, unitCost: Number(fallbackUnitCost) || 0 });
+  }
+  return out;
+}
+
+function popVendorCostLotsLifo_(entries, takeQty, fallbackUnitCost) {
+  let need = Math.max(0, Number(takeQty) || 0);
+  const remaining = (entries || []).map(function (e) {
+    return { lotId: e.lotId || '', qty: Number(e.qty) || 0, unitCost: Number(e.unitCost) || 0 };
+  });
+  const popped = [];
+  for (let i = remaining.length - 1; i >= 0 && need > 0; i--) {
+    const take = Math.min(remaining[i].qty, need);
+    if (take <= 0) continue;
+    popped.push({ lotId: remaining[i].lotId, qty: take, unitCost: remaining[i].unitCost });
+    remaining[i].qty -= take;
+    need -= take;
+  }
+  if (need > 0) {
+    popped.push({ lotId: '', qty: need, unitCost: Number(fallbackUnitCost) || 0 });
+  }
+  return {
+    popped: popped,
+    remaining: remaining.filter(function (e) { return e.qty > 0; })
+  };
+}
+
+function restoreVendorCostSlices_(productId, productName, sourceTag, dateVal, slices) {
+  const restored = [];
+  (slices || []).forEach(function (s) {
+    const qty = Number(s.qty) || 0;
+    if (qty <= 0) return;
+    const lotId = createInboundLot_(productId, productName, sourceTag, dateVal, Number(s.unitCost) || 0, qty).id;
+    restored.push({ lotId: lotId, qty: qty, unitCost: Number(s.unitCost) || 0 });
+  });
+  return restored;
+}
+
+/**
  * Settles part or all of a Receivable with stock instead of cash — the
  * vendor brings products back to us (see the user's own two-way example).
  * Always linked to the original VENDOR_ISSUES row, capped the same way
@@ -733,11 +820,20 @@ function receiveProductsFromVendor(token, payload) {
     const dateStr = txDate.dateStr;
 
     const newStock = adjustProductStock_(issue['Product ID'], qty, issue['Product Name']);
-    const lotId = createInboundLot_(issue['Product ID'], issue['Product Name'], 'VENDOR-RETURN-RECEIVED', now, unitValue, qty).id;
-    appendRow_('STOCK_MOVEMENT', {
-      'Movement ID': generateId_('STOCK_MOVEMENT'), 'Date': now, 'Product ID': issue['Product ID'],
-      'Product Name': issue['Product Name'], 'Type': 'Vendor Return Received', 'Reference': issue['Issue ID'],
-      'Quantity In': qty, 'Quantity Out': '', 'Balance Stock': newStock, 'Notes': 'Received back from ' + vendor['Vendor Name'], 'Lot ID': lotId
+    const issueCostLots = parseVendorCostLots_(issue['Cost Lots']);
+    const restoreSlices = issueCostLots.length
+      ? sliceVendorCostLots_(issueCostLots, alreadyReturned, qty, unitValue)
+      : [{ lotId: '', qty: qty, unitCost: unitValue }];
+    const restoredLots = restoreVendorCostSlices_(
+      issue['Product ID'], issue['Product Name'], 'VENDOR-RETURN-RECEIVED', now, restoreSlices
+    );
+    restoredLots.forEach(function (rl) {
+      appendRow_('STOCK_MOVEMENT', {
+        'Movement ID': generateId_('STOCK_MOVEMENT'), 'Date': now, 'Product ID': issue['Product ID'],
+        'Product Name': issue['Product Name'], 'Type': 'Vendor Return Received', 'Reference': issue['Issue ID'],
+        'Quantity In': rl.qty, 'Quantity Out': '', 'Balance Stock': newStock,
+        'Notes': 'Received back from ' + vendor['Vendor Name'], 'Lot ID': rl.lotId
+      });
     });
 
     const totalValue = qty * unitValue;

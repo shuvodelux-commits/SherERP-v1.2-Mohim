@@ -1802,14 +1802,18 @@ function getVendorIssueMemoForEdit(token, memoId) {
   }
 }
 
-/** Undoes a Vendor Issue's stock + Receivable effect: stock back (fresh lot), Receivable back down. */
+/** Undoes a Vendor Issue's stock + Receivable effect: restores exact consumed FIFO lot costs, Receivable back down. */
 function reverseVendorIssueStockAndReceivable_(row, user, reason, when) {
   var qty = Number(row['Quantity']) || 0;
   var unitValue = Number(row['Unit Value']) || 0;
   var newStock = adjustProductStock_(row['Product ID'], qty, row['Product Name']);
-  var lot = createInboundLot_(row['Product ID'], row['Product Name'], 'VENDOR-ISSUE-REVERSAL', when, unitValue, qty).id;
-  logReversalMovement_(row['Product ID'], row['Product Name'], 'Vendor Issue Reversed',
-    row['Issue ID'], qty, '', newStock, lot, reason);
+  var costLots = parseVendorCostLots_(row['Cost Lots']);
+  var slices = costLots.length ? costLots : [{ lotId: '', qty: qty, unitCost: unitValue }];
+  var restored = restoreVendorCostSlices_(row['Product ID'], row['Product Name'], 'VENDOR-ISSUE-REVERSAL', when, slices);
+  restored.forEach(function (rl) {
+    logReversalMovement_(row['Product ID'], row['Product Name'], 'Vendor Issue Reversed',
+      row['Issue ID'], rl.qty, '', newStock, rl.lotId, reason);
+  });
   adjustVendorReceivable_(row['Vendor ID'], -(qty * unitValue));
 }
 
@@ -1866,10 +1870,15 @@ function updateVendorIssueInternal_(token, issueId, payload, options) {
 
     // ---------------- write phase ----------------
     var newStock = currentStock;
+    var costEntries = parseVendorCostLots_(row['Cost Lots']);
+    var hasTrackedCosts = costEntries.length > 0;
     if (stockDelta > 0) {
       var consumption = applyStockConsumption_(extraPlan);
       newStock = adjustProductStock_(row['Product ID'], -stockDelta, row['Product Name']);
       consumption.forEach(function (c) {
+        if (hasTrackedCosts) {
+          costEntries.push({ lotId: c.lotId || '', qty: Number(c.qty) || 0, unitCost: Number(c.unitCost) || 0 });
+        }
         appendRow_('STOCK_MOVEMENT', {
           'Movement ID': generateId_('STOCK_MOVEMENT'), 'Date': now, 'Product ID': row['Product ID'],
           'Product Name': row['Product Name'], 'Type': 'Vendor Issue Edit', 'Reference': issueId,
@@ -1880,15 +1889,32 @@ function updateVendorIssueInternal_(token, issueId, payload, options) {
     } else if (stockDelta < 0) {
       var giveBack = Math.abs(stockDelta);
       newStock = adjustProductStock_(row['Product ID'], giveBack, row['Product Name']);
-      var reversalLot = createInboundLot_(row['Product ID'], row['Product Name'], 'VENDOR-ISSUE-EDIT-REVERSAL', now, Number(row['Unit Value']) || 0, giveBack).id;
-      logReversalMovement_(row['Product ID'], row['Product Name'], 'Vendor Issue Edit Reversal', issueId,
-        giveBack, '', newStock, reversalLot, 'Issue quantity reduced');
+      var restoreSlices;
+      if (hasTrackedCosts) {
+        var popped = popVendorCostLotsLifo_(costEntries, giveBack, Number(row['Unit Value']) || 0);
+        restoreSlices = popped.popped;
+        costEntries = popped.remaining;
+      } else {
+        restoreSlices = [{ lotId: '', qty: giveBack, unitCost: Number(row['Unit Value']) || 0 }];
+      }
+      var restoredLots = restoreVendorCostSlices_(
+        row['Product ID'], row['Product Name'], 'VENDOR-ISSUE-EDIT-REVERSAL', now, restoreSlices
+      );
+      restoredLots.forEach(function (rl) {
+        logReversalMovement_(row['Product ID'], row['Product Name'], 'Vendor Issue Edit Reversal', issueId,
+          rl.qty, '', newStock, rl.lotId, 'Issue quantity reduced');
+      });
     }
 
-    updateRowFields_('VENDOR_ISSUES', row._rowIndex, {
+    var issueUpdateFields = {
       'Date': dateStr, 'Quantity': newQty, 'Unit Value': newUnitValue, 'Total Value': newTotal,
       'Notes': sanitizeInput_(payload.notes)
-    });
+    };
+    if (hasTrackedCosts) {
+      issueUpdateFields['Cost Lots'] = formatVendorCostLots_(costEntries);
+      issueUpdateFields['Total Cost'] = totalVendorCostLots_(costEntries);
+    }
+    updateRowFields_('VENDOR_ISSUES', row._rowIndex, issueUpdateFields);
     
       adjustVendorReceivable_(row['Vendor ID'], -oldTotal);
       markMatchingDeleted_('VENDOR_LEDGER', function (l) {
@@ -2297,9 +2323,17 @@ function updateVendorReturnReceivedInternal_(token, returnId, payload, options) 
     var newStock = currentStock;
     if (stockDelta > 0) {
       newStock = adjustProductStock_(row['Product ID'], stockDelta, row['Product Name']);
-      var lotId = createInboundLot_(row['Product ID'], row['Product Name'], 'VENDOR-RETURN-RECEIVED-EDIT', now, newUnitValue, stockDelta).id;
-      logReversalMovement_(row['Product ID'], row['Product Name'], 'Vendor Return Received Edit', returnId,
-        stockDelta, '', newStock, lotId, 'Receipt quantity increased');
+      var parentCostLots = parseVendorCostLots_(issue['Cost Lots']);
+      var addSlices = parentCostLots.length
+        ? sliceVendorCostLots_(parentCostLots, otherReturned + oldQty, stockDelta, newUnitValue)
+        : [{ lotId: '', qty: stockDelta, unitCost: newUnitValue }];
+      var restoredEditLots = restoreVendorCostSlices_(
+        row['Product ID'], row['Product Name'], 'VENDOR-RETURN-RECEIVED-EDIT', now, addSlices
+      );
+      restoredEditLots.forEach(function (rl) {
+        logReversalMovement_(row['Product ID'], row['Product Name'], 'Vendor Return Received Edit', returnId,
+          rl.qty, '', newStock, rl.lotId, 'Receipt quantity increased');
+      });
     } else if (stockDelta < 0) {
       var consumption = applyStockConsumption_(removalPlan);
       newStock = adjustProductStock_(row['Product ID'], stockDelta, row['Product Name']);
