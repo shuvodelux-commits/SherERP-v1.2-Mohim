@@ -1093,7 +1093,40 @@ function getBalanceSheetReport(token) {
       bankAdjustments = roundMoney_(bankAdjustments + (Number(r['Credit']) || 0) - (Number(r['Debit']) || 0));
     });
 
-    const adjustments = roundMoney_(cashAdjustments + bankAdjustments + stockAdjustments);
+    // Vendor stock trade margin: difference between billed value on active
+    // Vendor Issues / Returns Received / Vendor Returns and the actual FIFO
+    // inventory cost moved in STOCK_MOVEMENT (e.g. giving stock to a vendor at
+    // an agreed price above/below FIFO cost and settling in Cash).
+    const vendorMoveTypes = {
+      'Vendor Issue': true, 'Vendor Issue Edit': true, 'Vendor Issue Edit Reversal': true,
+      'Vendor Issue Reversed': true, 'Vendor Return Received': true,
+      'Vendor Return Received Edit': true, 'Vendor Return Received Reversed': true,
+      'Vendor Return': true, 'Vendor Return Reversed': true
+    };
+    let vendorBilledNet = 0;
+    activeRows_('VENDOR_ISSUES').forEach(function (r) {
+      vendorBilledNet = roundMoney_(vendorBilledNet + (Number(r['Total Value']) || 0));
+    });
+    activeRows_('VENDOR_RETURNS_RECEIVED').forEach(function (r) {
+      vendorBilledNet = roundMoney_(vendorBilledNet - (Number(r['Total Value']) || 0));
+    });
+    activeRows_('VENDOR_RETURNS').forEach(function (r) {
+      vendorBilledNet = roundMoney_(vendorBilledNet + (Number(r['Total Value']) || 0));
+    });
+    let vendorCostNet = 0;
+    getAllRows_('STOCK_MOVEMENT').forEach(function (m) {
+      if (!vendorMoveTypes[String(m['Type'] || '')] || m['Reversed By']) return;
+      const qtyDelta = (Number(m['Quantity Out']) || 0) - (Number(m['Quantity In']) || 0);
+      if (Math.abs(qtyDelta) < 1e-8) return;
+      const firstLot = String(m['Lot ID'] || '').split(',')[0].trim();
+      const unitCost = (firstLot && lotPriceById[firstLot] !== undefined)
+        ? lotPriceById[firstLot]
+        : (productById[m['Product ID']] ? (Number(productById[m['Product ID']]['Purchase Price']) || 0) : 0);
+      vendorCostNet = roundMoney_(vendorCostNet + qtyDelta * unitCost);
+    });
+    const vendorMargin = roundMoney_(vendorBilledNet - vendorCostNet);
+
+    const adjustments = roundMoney_(cashAdjustments + bankAdjustments + stockAdjustments + vendorMargin);
     const totalEquity = roundMoney_(ownerCapital + retainedEarnings + openingBalanceEquity + adjustments);
     const totalLiabilitiesAndEquity = roundMoney_(totalLiabilities + totalEquity);
     const difference = roundMoney_(totalAssets - totalLiabilitiesAndEquity);
